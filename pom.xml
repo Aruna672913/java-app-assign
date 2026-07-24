@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+    Maven configuration for the devopsproject application.
+    This project is packaged as a WAR file for Tomcat deployment.
+-->
+
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <!-- Maven POM model version -->
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Organization or project group name -->
+    <groupId>com.devopsproject</groupId>
+
+    <!-- Application/project name -->
+    <artifactId>devopsproject</artifactId>
+
+    <!-- Application version -->
+    <version>1.0.0</version>
+
+    <!-- Generate a WAR file for Tomcat -->
+    <packaging>war</packaging>
+
+    <build>
+
+        <!-- Output file: target/devopsproject.war -->
+        <finalName>devopsproject</finalName>
+
+        <plugins>
+
+            <!-- Plugin used to create the WAR file -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-war-plugin</artifactId>
+                <version>3.4.0</version>
+
+                <configuration>
+                    <!-- Allow the build without WEB-INF/web.xml -->
+                    <failOnMissingWebXml>false</failOnMissingWebXml>
+                </configuration>
+            </plugin>
+
+        </plugins>
+
+    </build>
+
+</project>

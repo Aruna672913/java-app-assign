@@ -23,16 +23,15 @@ jobs:
           java-version: '17'
           cache: maven
           
-      - name: Build WAR and run SonarQube scan
+       - name: Build WAR and run SonarQube scan
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: >
-          mvn clean verify
-          org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
-          -Dsonar.token=${SONAR_TOKEN}
-          -Dsonar.organization=Aruna672913
-          -Dsonar.projectKey=Aruna672913/java-app-assign
-          -Dsonar.host.url=https://sonarcloud.io
+        run: |
+          mvn clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.token="${SONAR_TOKEN}" \
+            -Dsonar.organization=aruna672913 \
+            -Dsonar.projectKey=Aruna672913_java-app-assign \
+            -Dsonar.host.url=https://sonarcloud.io
 
       - name: Upload WAR artifact
         uses: actions/upload-artifact@v4

@@ -30,8 +30,8 @@ jobs:
           mvn clean verify
           org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
           -Dsonar.token=${SONAR_TOKEN}
-          -Dsonar.organization=aruna672913
-          -Dsonar.projectKey=aruna672913_java-app-assign
+          -Dsonar.organization=Aruna672913
+          -Dsonar.projectKey=Aruna672913/java-app-assign
           -Dsonar.host.url=https://sonarcloud.io
 
       - name: Upload WAR artifact

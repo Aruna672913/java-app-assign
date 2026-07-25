@@ -29,7 +29,7 @@ jobs:
         run: >
           mvn clean verify
           org.sonarsource.scanner.maven:sonar-maven-plugin:sonar
-          -Dsonar.token=${github-action-token}
+          -Dsonar.token=${SONAR_TOKEN}
           -Dsonar.organization=aruna672913
           -Dsonar.projectKey=aruna672913_java-app-assign
           -Dsonar.host.url=https://sonarcloud.io

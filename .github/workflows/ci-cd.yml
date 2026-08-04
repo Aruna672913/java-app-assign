@@ -7,20 +7,28 @@ on:
   workflow_dispatch:
 
 env:
+  # Must exactly match the EC2 Name tag in AWS
   EC2_NAME: Webserver
+
+  # Maven-generated WAR file
   WAR_FILE: target/devopsproject.war
+
+  # Application name in Tomcat URL
   APP_NAME: devopsproject
-  TOMCAT_HOME: /opt/tomcat
+
+  # EC2 login user and Tomcat location
   EC2_USER: ec2-user
+  TOMCAT_HOME: /opt/tomcat
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Download source code
+
+      # 1. Download code
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -36,13 +44,10 @@ jobs:
       - name: Build WAR
         run: mvn clean package
 
-      # 4. Confirm WAR exists
+      # 4. Confirm WAR file exists
       - name: Verify WAR
         shell: bash
         run: |
-          set -e
-
-          echo "Target folder:"
           ls -la target
 
           if [ ! -f "${{ env.WAR_FILE }}" ]; then
@@ -52,7 +57,7 @@ jobs:
 
           echo "WAR file found: ${{ env.WAR_FILE }}"
 
-      # 5. Run SonarCloud scan
+      # 5. SonarCloud scan
       - name: SonarCloud Scan
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -71,17 +76,24 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # 7. Test AWS connection
+      # 7. Confirm AWS login and region
       - name: Test AWS connection
-        run: aws sts get-caller-identity
+        run: |
+          aws sts get-caller-identity
+          echo "AWS region: ${{ secrets.AWS_REGION }}"
 
-      # 8. Search for existing EC2
+      # 8. Display EC2 instances for troubleshooting
+      - name: List EC2 instances
+        run: |
+          aws ec2 describe-instances \
+            --query "Reservations[].Instances[].{Name:Tags[?Key=='Name']|[0].Value,ID:InstanceId,State:State.Name}" \
+            --output table
+
+      # 9. Check whether Webserver already exists
       - name: Check EC2
         id: check
         shell: bash
         run: |
-          set -e
-
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters \
               "Name=tag:Name,Values=${{ env.EC2_NAME }}" \
@@ -91,43 +103,37 @@ jobs:
 
           if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "EC2 instance does not exist"
+            echo "EC2 '${{ env.EC2_NAME }}' does not exist"
           else
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
             echo "Existing EC2 found: $INSTANCE_ID"
           fi
 
-      # 9. Create EC2 only when missing
+      # 10. Create EC2 only when missing
       - name: Create EC2
         id: create
         if: steps.check.outputs.exists == 'false'
         shell: bash
         run: |
-          set -e
-
-          if [ -z "${{ secrets.AWS_AMI_ID }}" ]; then
-            echo "GitHub secret AWS_AMI_ID is missing"
-            exit 1
-          fi
-
           if [ -z "${{ secrets.AWS_KEY_NAME }}" ]; then
-            echo "GitHub secret AWS_KEY_NAME is missing"
+            echo "AWS_KEY_NAME secret is missing"
             exit 1
           fi
 
           if [ -z "${{ secrets.AWS_SECURITY_GROUP_ID }}" ]; then
-            echo "GitHub secret AWS_SECURITY_GROUP_ID is missing"
+            echo "AWS_SECURITY_GROUP_ID secret is missing"
             exit 1
           fi
 
           if [ -z "${{ secrets.AWS_SUBNET_ID }}" ]; then
-            echo "GitHub secret AWS_SUBNET_ID is missing"
+            echo "AWS_SUBNET_ID secret is missing"
             exit 1
           fi
 
           INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id "${{ secrets.AWS_AMI_ID }}" \
+            --image-id \
+              resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
             --instance-type t3.micro \
             --key-name "${{ secrets.AWS_KEY_NAME }}" \
             --security-group-ids "${{ secrets.AWS_SECURITY_GROUP_ID }}" \
@@ -152,13 +158,11 @@ jobs:
           aws ec2 wait instance-status-ok \
             --instance-ids "$INSTANCE_ID"
 
-      # 10. Get EC2 state and public IP
+      # 11. Use existing or newly created EC2
       - name: Get EC2 details
         id: server
         shell: bash
         run: |
-          set -e
-
           if [ "${{ steps.check.outputs.exists }}" = "true" ]; then
             INSTANCE_ID="${{ steps.check.outputs.instance_id }}"
           else
@@ -166,7 +170,7 @@ jobs:
           fi
 
           if [ -z "$INSTANCE_ID" ]; then
-            echo "Instance ID is empty"
+            echo "EC2 instance ID is empty"
             exit 1
           fi
 
@@ -175,7 +179,7 @@ jobs:
             --query "Reservations[0].Instances[0].State.Name" \
             --output text)
 
-          echo "Current EC2 state: $STATE"
+          echo "EC2 state: $STATE"
 
           if [ "$STATE" = "stopping" ]; then
             aws ec2 wait instance-stopped \
@@ -219,26 +223,24 @@ jobs:
           echo "EC2 ID: $INSTANCE_ID"
           echo "Public IP: $PUBLIC_IP"
 
-      # 11. Create temporary PEM key
+      # 12. Recreate PEM file from GitHub secret
       - name: Prepare SSH key
         shell: bash
         run: |
-          set -e
-
           printf '%s\n' "${{ secrets.EC2_PRIVATE_KEY }}" > key.pem
           chmod 600 key.pem
 
           if [ ! -s key.pem ]; then
-            echo "EC2_PRIVATE_KEY secret is empty"
+            echo "EC2_PRIVATE_KEY secret is missing"
             exit 1
           fi
 
-      # 12. Wait until SSH is ready
+      # 13. Wait for SSH
       - name: Wait for SSH
         shell: bash
         run: |
           for attempt in {1..30}; do
-            echo "SSH attempt: $attempt"
+            echo "SSH attempt $attempt"
 
             if ssh \
               -o StrictHostKeyChecking=no \
@@ -259,7 +261,7 @@ jobs:
           echo "SSH connection failed"
           exit 1
 
-      # 13. Install Java and Tomcat if missing
+      # 14. Install Java and Tomcat only when missing
       - name: Install Java and Tomcat
         shell: bash
         run: |
@@ -298,7 +300,7 @@ jobs:
 
           REMOTE
 
-      # 14. Copy devopsproject.war to EC2
+      # 15. Copy devopsproject.war to EC2
       - name: Copy WAR to EC2
         shell: bash
         run: |
@@ -309,7 +311,7 @@ jobs:
             "${{ env.WAR_FILE }}" \
             "${{ env.EC2_USER }}@${{ steps.server.outputs.public_ip }}:/tmp/${{ env.APP_NAME }}.war"
 
-      # 15. Deploy WAR into Tomcat
+      # 16. Deploy WAR to Tomcat
       - name: Deploy application
         shell: bash
         run: |
@@ -322,7 +324,6 @@ jobs:
               set -e
 
               sudo /opt/tomcat/bin/shutdown.sh || true
-
               sleep 5
 
               sudo rm -rf \
@@ -342,7 +343,7 @@ jobs:
 
           REMOTE
 
-      # 16. Verify application URL
+      # 17. Verify public application
       - name: Verify application
         shell: bash
         run: |
@@ -357,7 +358,7 @@ jobs:
               --write-out "%{http_code}" \
               "$URL" || true)
 
-            echo "Attempt $attempt - HTTP status: $STATUS"
+            echo "Attempt $attempt: HTTP $STATUS"
 
             if [ "$STATUS" = "200" ]; then
               echo "Application deployed successfully"
@@ -371,7 +372,7 @@ jobs:
           echo "Application verification failed"
           exit 1
 
-      # 17. Delete temporary private key
+      # 18. Remove temporary key
       - name: Delete temporary key
         if: always()
         run: rm -f key.pem

@@ -6,33 +6,40 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   EC2_NAME: Webserver
   EC2_USER: ec2-user
   WAR_FILE: target/devopsproject.war
   APP_NAME: devopsproject
-  TOMCAT_VERSION: 10.1.57
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Download source code
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
+      # 2. Install Java on GitHub runner
       - name: Setup Java 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: "17"
           cache: maven
 
+      # 3. Build WAR
       - name: Build WAR
         run: mvn clean package
 
+      # 4. Verify WAR
       - name: Verify WAR
         shell: bash
         run: |
@@ -45,6 +52,7 @@ jobs:
 
           echo "WAR file created: $WAR_FILE"
 
+      # 5. Run SonarCloud scan
       - name: SonarCloud scan
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -55,16 +63,19 @@ jobs:
             -Dsonar.projectKey=Aruna672913_java-app-assign \
             -Dsonar.host.url=https://sonarcloud.io
 
+      # 6. Configure AWS credentials
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      # 7. Verify AWS login
       - name: Test AWS connection
         run: aws sts get-caller-identity
 
+      # 8. Check for existing EC2
       - name: Check EC2
         id: check_ec2
         shell: bash
@@ -85,12 +96,20 @@ jobs:
             echo "Existing EC2 found: $INSTANCE_ID"
           fi
 
+      # 9. Create EC2 only when missing
       - name: Create EC2
         id: create_ec2
         if: steps.check_ec2.outputs.exists == 'false'
         shell: bash
+        env:
+          AWS_KEY_NAME: ${{ secrets.AWS_KEY_NAME }}
         run: |
-          set -e
+          set -euo pipefail
+
+          if [ -z "$AWS_KEY_NAME" ]; then
+            echo "AWS_KEY_NAME is empty"
+            exit 1
+          fi
 
           VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=is-default,Values=true" \
@@ -124,12 +143,14 @@ jobs:
           if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
             SG_ID=$(aws ec2 create-security-group \
               --group-name java-app-sg \
-              --description "Java Tomcat security group" \
+              --description "Java Tomcat POC security group" \
               --vpc-id "$VPC_ID" \
               --query "GroupId" \
               --output text)
           fi
 
+          # POC only: open SSH and Tomcat to the internet.
+          # For production, restrict port 22 and place Tomcat behind HTTPS.
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
             --protocol tcp \
@@ -159,7 +180,7 @@ jobs:
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "$AMI_ID" \
             --instance-type t3.micro \
-            --key-name "${{ secrets.AWS_KEY_NAME }}" \
+            --key-name "$AWS_KEY_NAME" \
             --security-group-ids "$SG_ID" \
             --subnet-id "$SUBNET_ID" \
             --associate-public-ip-address \
@@ -174,6 +195,7 @@ jobs:
           fi
 
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "New EC2 created: $INSTANCE_ID"
 
           aws ec2 wait instance-running \
             --instance-ids "$INSTANCE_ID"
@@ -181,6 +203,7 @@ jobs:
           aws ec2 wait instance-status-ok \
             --instance-ids "$INSTANCE_ID"
 
+      # 10. Select existing or newly created EC2
       - name: Get EC2 details
         id: server
         shell: bash
@@ -189,6 +212,11 @@ jobs:
             INSTANCE_ID="${{ steps.check_ec2.outputs.instance_id }}"
           else
             INSTANCE_ID="${{ steps.create_ec2.outputs.instance_id }}"
+          fi
+
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "Instance ID is empty"
+            exit 1
           fi
 
           STATE=$(aws ec2 describe-instances \
@@ -213,6 +241,14 @@ jobs:
               --instance-ids "$INSTANCE_ID"
           fi
 
+          if [ "$STATE" = "pending" ]; then
+            aws ec2 wait instance-running \
+              --instance-ids "$INSTANCE_ID"
+
+            aws ec2 wait instance-status-ok \
+              --instance-ids "$INSTANCE_ID"
+          fi
+
           PUBLIC_IP=$(aws ec2 describe-instances \
             --instance-ids "$INSTANCE_ID" \
             --query "Reservations[0].Instances[0].PublicIpAddress" \
@@ -227,17 +263,21 @@ jobs:
           echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
           echo "Public IP: $PUBLIC_IP"
 
+      # 11. Create temporary PEM file safely
       - name: Prepare SSH key
         shell: bash
+        env:
+          EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
         run: |
-          printf '%s\n' "${{ secrets.EC2_PRIVATE_KEY }}" > key.pem
-          chmod 600 key.pem
-
-          if [ ! -s key.pem ]; then
+          if [ -z "$EC2_PRIVATE_KEY" ]; then
             echo "EC2_PRIVATE_KEY is empty"
             exit 1
           fi
 
+          printf '%s\n' "$EC2_PRIVATE_KEY" > key.pem
+          chmod 600 key.pem
+
+      # 12. Wait for SSH
       - name: Wait for SSH
         shell: bash
         run: |
@@ -259,6 +299,7 @@ jobs:
           echo "SSH connection failed"
           exit 1
 
+      # 13. Install Java and Tomcat
       - name: Install Java and Tomcat
         shell: bash
         run: |
@@ -304,11 +345,11 @@ jobs:
           fi
 
           chmod +x /opt/tomcat/bin/*.sh
-
           echo "Tomcat installation successful"
 
           REMOTE
 
+      # 14. Copy WAR to EC2
       - name: Copy WAR to EC2
         shell: bash
         run: |
@@ -319,6 +360,7 @@ jobs:
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}:/tmp/$APP_NAME.war"
 
+      # 15. Deploy WAR to Tomcat
       - name: Deploy application
         shell: bash
         run: |
@@ -329,7 +371,7 @@ jobs:
             "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
             "sudo bash -s" <<'REMOTE'
 
-          set -e
+          set -euo pipefail
 
           APP_NAME="devopsproject"
 
@@ -349,10 +391,15 @@ jobs:
 
           REMOTE
 
+      # 16. Verify public URL
       - name: Verify application
         shell: bash
         run: |
-          URL="http://${{ steps.server.outputs.public_ip }}:8080/$APP_NAME/"
+          # POC only: Tomcat is exposed on HTTP 8080 without TLS.
+          # Production should use HTTPS through an ALB and ACM certificate.
+          URL="http://${{ steps.server.outputs.public_ip }}:8080/$APP_NAME/" # NOSONAR
+
+          echo "Checking: $URL"
 
           for attempt in {1..30}; do
             STATUS=$(curl \
@@ -375,6 +422,7 @@ jobs:
           echo "Application verification failed"
           exit 1
 
+      # 17. Remove temporary PEM file
       - name: Delete temporary SSH key
         if: always()
         run: rm -f key.pem

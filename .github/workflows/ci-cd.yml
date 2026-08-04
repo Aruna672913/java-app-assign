@@ -64,7 +64,7 @@ jobs:
             -Dsonar.projectKey=Aruna672913_java-app-assign \
             -Dsonar.host.url=https://sonarcloud.io
 
-      # 6. Configure AWS
+      # 6. Configure AWS credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
         with:
@@ -72,11 +72,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # 7. Test AWS connection
+      # 7. Test AWS login
       - name: Test AWS connection
         run: aws sts get-caller-identity
 
-      # 8. Check whether EC2 exists
+      # 8. Check whether EC2 already exists
       - name: Check EC2
         id: check_ec2
         shell: bash
@@ -97,7 +97,7 @@ jobs:
             echo "Existing EC2 found: $INSTANCE_ID"
           fi
 
-      # 9. Create EC2 only if missing
+      # 9. Create EC2 only when missing
       - name: Create EC2
         id: create_ec2
         if: steps.check_ec2.outputs.exists == 'false'
@@ -207,7 +207,7 @@ jobs:
           aws ec2 wait instance-status-ok \
             --instance-ids "$INSTANCE_ID"
 
-      # 10. Get existing or newly created EC2 details
+      # 10. Get EC2 details
       - name: Get EC2 details
         id: server
         shell: bash
@@ -295,7 +295,7 @@ jobs:
             --port "$TOMCAT_PORT" \
             --cidr 0.0.0.0/0 || true
 
-      # 12. Create temporary SSH key
+      # 12. Prepare SSH key
       - name: Prepare SSH key
         shell: bash
         env:
@@ -424,42 +424,52 @@ jobs:
             "/opt/tomcat/webapps/${APP_NAME}.war"
 
           /opt/tomcat/bin/startup.sh
-          sleep 10
-
-          ss -ltnp | grep 8080
 
           REMOTE
 
-      # 17. Verify public application URL
-      - name: Verify application
+      # 17. Verify deployment through SSH
+      - name: Verify application deployment
         shell: bash
         run: |
-          # POC-only endpoint. Production should use HTTPS through ALB + ACM.
-          SCHEME="http" # NOSONAR
-          URL="${SCHEME}://${{ steps.server.outputs.public_ip }}:${TOMCAT_PORT}/${APP_NAME}/" # NOSONAR
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -i key.pem \
+            "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
+            "sudo bash -s" <<'REMOTE'
 
-          echo "Checking application endpoint"
+          set -euo pipefail
+
+          APP_NAME="devopsproject"
 
           for attempt in {1..30}; do
-            STATUS=$(curl \
-              --silent \
-              --output /dev/null \
-              --write-out "%{http_code}" \
-              "$URL" || true) # NOSONAR
+            if pgrep -f "org.apache.catalina.startup.Bootstrap" >/dev/null \
+              && ss -ltn | grep -q ":8080 " \
+              && [ -f "/opt/tomcat/webapps/${APP_NAME}.war" ] \
+              && [ -d "/opt/tomcat/webapps/${APP_NAME}" ]; then
 
-            echo "Attempt $attempt: HTTP $STATUS"
-
-            if [ "$STATUS" = "200" ]; then
-              echo "Application deployed successfully"
-              echo "Application URL: $URL" # NOSONAR
+              echo "Tomcat is running"
+              echo "Port 8080 is listening"
+              echo "WAR is deployed"
+              echo "Application directory exists"
+              echo "Deployment verified successfully"
               exit 0
             fi
 
+            echo "Waiting for application deployment: attempt $attempt"
             sleep 10
           done
 
-          echo "Application verification failed"
+          echo "Application deployment verification failed"
+          echo "Tomcat log output:"
+          tail -100 /opt/tomcat/logs/catalina.out || true
           exit 1
+
+          REMOTE
+
+          echo "Public IP: ${{ steps.server.outputs.public_ip }}"
+          echo "Application port: $TOMCAT_PORT"
+          echo "Application path: /$APP_NAME/"
 
       # 18. Delete temporary SSH key
       - name: Delete temporary SSH key

@@ -32,7 +32,15 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: mvn org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar -Dsonar.token="${SONAR_TOKEN}" -Dsonar.organization=aruna672913 -Dsonar.projectKey=Aruna672913_java-app-assign -Dsonar.host.url=https://sonarcloud.io
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Verify AWS connection
+        run: aws sts get-caller-identity
       - name: Upload WAR artifact
         if: always()
         uses: actions/upload-artifact@v4

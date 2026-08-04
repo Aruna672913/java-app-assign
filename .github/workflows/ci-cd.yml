@@ -42,7 +42,8 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
+          mvn -B \
+            org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
             -Dsonar.token="$SONAR_TOKEN" \
             -Dsonar.organization=aruna672913 \
             -Dsonar.projectKey=Aruna672913_java-app-assign \
@@ -55,6 +56,31 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION }}
 
+      - name: Allow GitHub runner SSH
+        id: runner
+        env:
+          SECURITY_GROUP_ID: ${{ vars.SECURITY_GROUP_ID || secrets.SECURITY_GROUP_ID }}
+        run: |
+          RUNNER_IP=$(curl -fsS https://checkip.amazonaws.com |
+            tr -d '[:space:]')
+
+          echo "GitHub runner IP: $RUNNER_IP"
+          echo "ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
+
+          if ! aws ec2 authorize-security-group-ingress \
+            --group-id "$SECURITY_GROUP_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "$RUNNER_IP/32" 2>sg-error.txt
+          then
+            if grep -q "InvalidPermission.Duplicate" sg-error.txt; then
+              echo "SSH rule already exists"
+            else
+              cat sg-error.txt
+              exit 1
+            fi
+          fi
+
       - name: Find or create EC2
         id: ec2
         env:
@@ -65,8 +91,11 @@ jobs:
         run: |
           set -e
 
-          if [ -z "$VPC_ID" ] || [ -z "$SUBNET_ID" ] || [ -z "$SECURITY_GROUP_ID" ]; then
-            echo "VPC_ID, SUBNET_ID or SECURITY_GROUP_ID is missing"
+          if [ -z "$VPC_ID" ] ||
+             [ -z "$SUBNET_ID" ] ||
+             [ -z "$SECURITY_GROUP_ID" ] ||
+             [ -z "$AWS_KEY_NAME" ]; then
+            echo "AWS network value or key name is missing"
             exit 1
           fi
 
@@ -78,8 +107,10 @@ jobs:
             --query "Reservations[].Instances[].InstanceId | [0]" \
             --output text)
 
-          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
-            echo "Creating new EC2"
+          if [ "$INSTANCE_ID" = "None" ] ||
+             [ -z "$INSTANCE_ID" ]; then
+
+            echo "Creating new EC2 instance"
 
             AMI_ID=$(aws ec2 describe-images \
               --owners amazon \
@@ -96,9 +127,13 @@ jobs:
               --subnet-id "$SUBNET_ID" \
               --security-group-ids "$SECURITY_GROUP_ID" \
               --associate-public-ip-address \
-              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$EC2_NAME}]" \
+              --tag-specifications \
+                "ResourceType=instance,Tags=[{Key=Name,Value=$EC2_NAME}]" \
               --query "Instances[0].InstanceId" \
               --output text)
+
+            echo "Created EC2: $INSTANCE_ID"
+
           else
             echo "Using existing EC2: $INSTANCE_ID"
 
@@ -108,61 +143,94 @@ jobs:
               --output text)
 
             if [ "$STATE" = "stopping" ]; then
-              aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+              aws ec2 wait instance-stopped \
+                --instance-ids "$INSTANCE_ID"
+
               STATE="stopped"
             fi
 
             if [ "$STATE" = "stopped" ]; then
-              aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
+              aws ec2 start-instances \
+                --instance-ids "$INSTANCE_ID" >/dev/null
             fi
           fi
 
-          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+          aws ec2 wait instance-running \
+            --instance-ids "$INSTANCE_ID"
+
+          aws ec2 wait instance-status-ok \
+            --instance-ids "$INSTANCE_ID"
 
           PUBLIC_IP=$(aws ec2 describe-instances \
             --instance-ids "$INSTANCE_ID" \
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)
 
-          test "$PUBLIC_IP" != "None" || {
-            echo "EC2 has no public IP"
+          if [ "$PUBLIC_IP" = "None" ] ||
+             [ -z "$PUBLIC_IP" ]; then
+            echo "EC2 does not have a public IP"
             exit 1
-          }
+          fi
 
           echo "ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
           echo "EC2 Public IP: $PUBLIC_IP"
 
-      - name: Deploy to Tomcat
+      - name: Deploy application
         env:
           EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
         run: |
+          if [ -z "$EC2_PRIVATE_KEY" ]; then
+            echo "EC2_PRIVATE_KEY is missing"
+            exit 1
+          fi
+
           printf '%s\n' "$EC2_PRIVATE_KEY" > key.pem
           chmod 600 key.pem
 
           IP="${{ steps.ec2.outputs.ip }}"
 
           for attempt in {1..30}; do
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-              -i key.pem "$EC2_USER@$IP" "echo connected" && break
+            if ssh \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              -i key.pem \
+              "$EC2_USER@$IP" \
+              "echo connected"
+            then
+              echo "SSH connected"
+              break
+            fi
 
             if [ "$attempt" = "30" ]; then
-              echo "SSH failed. Check port 22 and the subnet internet route."
+              echo "SSH connection failed"
+              echo "Check subnet route: 0.0.0.0/0 to Internet Gateway"
               exit 1
             fi
 
+            echo "Waiting for EC2 SSH..."
             sleep 10
           done
 
-          scp -o StrictHostKeyChecking=no -i key.pem \
-            "$WAR_FILE" "$EC2_USER@$IP:/tmp/$APP_NAME.war"
+          scp \
+            -o StrictHostKeyChecking=no \
+            -i key.pem \
+            "$WAR_FILE" \
+            "$EC2_USER@$IP:/tmp/$APP_NAME.war"
 
-          ssh -o StrictHostKeyChecking=no -i key.pem \
-            "$EC2_USER@$IP" "sudo bash -s -- '$APP_NAME'" <<'REMOTE'
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i key.pem \
+            "$EC2_USER@$IP" \
+            "sudo bash -s -- '$APP_NAME'" <<'REMOTE'
+
           set -e
+
           APP_NAME="$1"
 
-          dnf install -y java-17-amazon-corretto-headless curl tar
+          dnf install -y \
+            java-17-amazon-corretto-headless \
+            curl \
+            tar
 
           if [ ! -x /opt/tomcat/bin/startup.sh ]; then
             curl -fsSL \
@@ -170,24 +238,59 @@ jobs:
               -o /tmp/tomcat.tar.gz
 
             mkdir -p /opt/tomcat
-            tar -xzf /tmp/tomcat.tar.gz -C /opt/tomcat --strip-components=1
+
+            tar -xzf /tmp/tomcat.tar.gz \
+              -C /opt/tomcat \
+              --strip-components=1
+
             chmod +x /opt/tomcat/bin/*.sh
           fi
 
           /opt/tomcat/bin/shutdown.sh || true
           sleep 5
-          rm -rf "/opt/tomcat/webapps/$APP_NAME"*
-          cp "/tmp/$APP_NAME.war" "/opt/tomcat/webapps/$APP_NAME.war"
+
+          rm -rf "/opt/tomcat/webapps/$APP_NAME"
+          rm -f "/opt/tomcat/webapps/$APP_NAME.war"
+
+          cp "/tmp/$APP_NAME.war" \
+            "/opt/tomcat/webapps/$APP_NAME.war"
+
           /opt/tomcat/bin/startup.sh
+
           REMOTE
 
       - name: Verify deployment
         run: |
           URL="http://${{ steps.ec2.outputs.ip }}:$TOMCAT_PORT/$APP_NAME/"
-          curl --fail --retry 15 --retry-delay 10 --retry-connrefused "$URL"
+
+          curl \
+            --fail \
+            --retry 15 \
+            --retry-delay 10 \
+            --retry-connrefused \
+            "$URL"
+
+          echo "Application deployed successfully"
           echo "Application URL: $URL"
-          echo "Application URL: [$URL]($URL)" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Application URL: [$URL]($URL)" \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup
         if: always()
-        run: rm -f key.pem
+        env:
+          SECURITY_GROUP_ID: ${{ vars.SECURITY_GROUP_ID || secrets.SECURITY_GROUP_ID }}
+        run: |
+          rm -f key.pem sg-error.txt
+
+          RUNNER_IP="${{ steps.runner.outputs.ip }}"
+
+          if [ -n "$RUNNER_IP" ] &&
+             [ -n "$SECURITY_GROUP_ID" ]; then
+
+            aws ec2 revoke-security-group-ingress \
+              --group-id "$SECURITY_GROUP_ID" \
+              --protocol tcp \
+              --port 22 \
+              --cidr "$RUNNER_IP/32" 2>/dev/null || true
+          fi

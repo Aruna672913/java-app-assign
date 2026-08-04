@@ -24,29 +24,26 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Download code from GitHub
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # 1. Download code
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
 
-      # Install Java 17
+      # 2. Install Java
       - name: Setup Java
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
           cache: maven
 
-      # Build WAR and send analysis to SonarCloud
+      # 3. Build WAR and run SonarCloud
       - name: Build and SonarCloud scan
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          mvn -B clean verify
-
-          mvn -B \
+          mvn -B clean verify \
             org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
             -Dsonar.token="$SONAR_TOKEN" \
             -Dsonar.organization=aruna672913 \
@@ -55,15 +52,15 @@ jobs:
 
           test -f "$WAR_FILE"
 
-      # Login to AWS
+      # 4. Login to AWS
       - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # Find existing EC2 or create new EC2
+      # 5. Find existing EC2 or create new EC2
       - name: Find or create EC2
         id: ec2
         env:
@@ -82,10 +79,21 @@ jobs:
           if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
             echo "EC2 does not exist. Creating new EC2."
 
-            AMI_ID=$(aws ssm get-parameter \
-              --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
-              --query "Parameter.Value" \
+            AMI_ID=$(aws ec2 describe-images \
+              --owners amazon \
+              --filters \
+                "Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64" \
+                "Name=architecture,Values=x86_64" \
+                "Name=state,Values=available" \
+              --query "sort_by(Images,&CreationDate)[-1].ImageId" \
               --output text)
+
+            if [ "$AMI_ID" = "None" ] || [ -z "$AMI_ID" ]; then
+              echo "Amazon Linux AMI was not found"
+              exit 1
+            fi
+
+            echo "Using AMI: $AMI_ID"
 
             INSTANCE_ID=$(aws ec2 run-instances \
               --image-id "$AMI_ID" \
@@ -100,6 +108,7 @@ jobs:
               --output text)
 
             echo "New EC2 created: $INSTANCE_ID"
+
           else
             echo "Existing EC2 found: $INSTANCE_ID"
 
@@ -117,7 +126,7 @@ jobs:
 
             if [ "$STATE" = "stopped" ]; then
               aws ec2 start-instances \
-                --instance-ids "$INSTANCE_ID" >/dev/null
+                --instance-ids "$INSTANCE_ID"
             fi
           fi
 
@@ -140,7 +149,7 @@ jobs:
           echo "ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
           echo "EC2 Public IP: $PUBLIC_IP"
 
-      # Create the SSH private-key file
+      # 6. Create private key file
       - name: Prepare SSH key
         env:
           EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
@@ -148,7 +157,7 @@ jobs:
           printf '%s\n' "$EC2_PRIVATE_KEY" > key.pem
           chmod 600 key.pem
 
-      # Wait until EC2 accepts SSH
+      # 7. Wait until EC2 SSH is ready
       - name: Wait for EC2
         run: |
           for attempt in {1..30}; do
@@ -166,7 +175,7 @@ jobs:
           echo "Unable to connect to EC2"
           exit 1
 
-      # Copy WAR file to EC2
+      # 8. Copy WAR to EC2
       - name: Copy WAR
         run: |
           scp \
@@ -175,18 +184,18 @@ jobs:
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.ec2.outputs.ip }}:/tmp/$APP_NAME.war"
 
-      # Install Java and Tomcat, then deploy WAR
+      # 9. Install Java, Tomcat and deploy WAR
       - name: Deploy application
         run: |
           ssh \
             -o StrictHostKeyChecking=no \
             -i key.pem \
             "$EC2_USER@${{ steps.ec2.outputs.ip }}" \
-            "sudo bash -s" <<'REMOTE'
+            "sudo bash -s -- '$APP_NAME'" <<'REMOTE'
 
           set -e
 
-          APP_NAME="devopsproject"
+          APP_NAME="$1"
           TOMCAT_VERSION="9.0.120"
 
           dnf install -y \
@@ -221,7 +230,7 @@ jobs:
 
           REMOTE
 
-      # Verify the public URL
+      # 10. Verify application
       - name: Verify deployment
         run: |
           URL="http://${{ steps.ec2.outputs.ip }}:$TOMCAT_PORT/$APP_NAME/"
@@ -235,10 +244,9 @@ jobs:
 
           echo "Application deployed successfully"
           echo "Application URL: $URL"
-          echo "Application URL: [$URL]($URL)" \
-            >> "$GITHUB_STEP_SUMMARY"
+          echo "Application URL: [$URL]($URL)" >> "$GITHUB_STEP_SUMMARY"
 
-      # Remove private key from runner
+      # 11. Delete private key
       - name: Cleanup
         if: always()
         run: rm -f key.pem

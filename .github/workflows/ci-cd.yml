@@ -1,50 +1,229 @@
-name: Build Java WAR and SonarQube Scan
+name: Java CI/CD
 
 on:
   push:
     branches:
       - main
-  pull_request:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
-      - name: Set up Java 17
+      # 1. Get code from GitHub
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      # 2. Install Java on GitHub runner
+      - name: Setup Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
           cache: maven
 
+      # 3. Build application and create WAR
       - name: Build WAR
         run: mvn clean package
 
-      - name: Run SonarQube scan
+      # 4. Run SonarCloud scan
+      - name: SonarCloud scan
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: mvn org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar -Dsonar.token="${SONAR_TOKEN}" -Dsonar.organization=aruna672913 -Dsonar.projectKey=Aruna672913_java-app-assign -Dsonar.host.url=https://sonarcloud.io
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        run: |
+          mvn sonar:sonar \
+            -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.organization=aruna672913 \
+            -Dsonar.projectKey=Aruna672913_java-app-assign \
+            -Dsonar.host.url=https://sonarcloud.io
+
+      # 5. Connect GitHub Actions to AWS
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Verify AWS connection
+      # 6. Confirm AWS connection
+      - name: Test AWS connection
         run: aws sts get-caller-identity
-      - name: Upload WAR artifact
+
+      # 7. Find existing EC2
+      - name: Check EC2
+        id: check
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=java-app-server" \
+              "Name=instance-state-name,Values=running,stopped" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+
+          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "EC2 does not exist"
+          else
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+            echo "EC2 found: $INSTANCE_ID"
+          fi
+
+      # 8. Create EC2 only when missing
+      - name: Create EC2
+        id: create
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "${{ secrets.AWS_AMI_ID }}" \
+            --instance-type t3.micro \
+            --key-name "${{ secrets.AWS_KEY_NAME }}" \
+            --security-group-ids "${{ secrets.AWS_SECURITY_GROUP_ID }}" \
+            --subnet-id "${{ secrets.AWS_SUBNET_ID }}" \
+            --associate-public-ip-address \
+            --tag-specifications \
+              'ResourceType=instance,Tags=[{Key=Name,Value=java-app-server}]' \
+            --query "Instances[0].InstanceId" \
+            --output text)
+
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+          aws ec2 wait instance-running \
+            --instance-ids "$INSTANCE_ID"
+
+      # 9. Select existing or newly created EC2
+      - name: Get EC2 details
+        id: server
+        run: |
+          if [ "${{ steps.check.outputs.exists }}" = "true" ]; then
+            INSTANCE_ID="${{ steps.check.outputs.instance_id }}"
+          else
+            INSTANCE_ID="${{ steps.create.outputs.instance_id }}"
+          fi
+
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)
+
+          if [ "$STATE" = "stopped" ]; then
+            aws ec2 start-instances \
+              --instance-ids "$INSTANCE_ID"
+
+            aws ec2 wait instance-running \
+              --instance-ids "$INSTANCE_ID"
+          fi
+
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
+
+          echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+          echo "EC2 Public IP: $PUBLIC_IP"
+
+      # 10. Create temporary PEM key
+      - name: Prepare SSH key
+        run: |
+          printf '%s\n' "${{ secrets.EC2_PRIVATE_KEY }}" > key.pem
+          chmod 600 key.pem
+
+      # 11. Wait until EC2 SSH is ready
+      - name: Wait for SSH
+        run: |
+          for number in {1..20}; do
+            if ssh \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              -i key.pem \
+              ec2-user@${{ steps.server.outputs.public_ip }} \
+              "echo SSH connected"; then
+              exit 0
+            fi
+
+            echo "Waiting for EC2..."
+            sleep 15
+          done
+
+          exit 1
+
+      # 12. Install Java and Tomcat if missing
+      - name: Install Java and Tomcat
+        run: |
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i key.pem \
+            ec2-user@${{ steps.server.outputs.public_ip }} <<'EOF'
+
+              if [ ! -d /opt/tomcat ]; then
+
+                sudo dnf install -y \
+                  java-17-amazon-corretto-devel \
+                  wget \
+                  tar
+
+                cd /tmp
+
+                wget https://archive.apache.org/dist/tomcat/tomcat-10/v10.1.57/bin/apache-tomcat-10.1.57.tar.gz
+
+                sudo tar -xzf \
+                  apache-tomcat-10.1.57.tar.gz \
+                  -C /opt
+
+                sudo mv \
+                  /opt/apache-tomcat-10.1.57 \
+                  /opt/tomcat
+
+                sudo chmod +x \
+                  /opt/tomcat/bin/*.sh
+              fi
+
+          EOF
+
+      # 13. Copy WAR file to EC2
+      - name: Copy WAR
+        run: |
+          scp \
+            -o StrictHostKeyChecking=no \
+            -i key.pem \
+            target/java-app.war \
+            ec2-user@${{ steps.server.outputs.public_ip }}:/tmp/java-app.war
+
+      # 14. Deploy WAR to Tomcat
+      - name: Deploy application
+        run: |
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i key.pem \
+            ec2-user@${{ steps.server.outputs.public_ip }} <<'EOF'
+
+              sudo /opt/tomcat/bin/shutdown.sh || true
+
+              sleep 5
+
+              sudo rm -rf \
+                /opt/tomcat/webapps/java-app
+
+              sudo rm -f \
+                /opt/tomcat/webapps/java-app.war
+
+              sudo cp \
+                /tmp/java-app.war \
+                /opt/tomcat/webapps/java-app.war
+
+              sudo /opt/tomcat/bin/startup.sh
+
+          EOF
+
+      # 15. Show final application URL
+      - name: Show application URL
+        run: |
+          echo "Application deployed successfully"
+          echo "http://${{ steps.server.outputs.public_ip }}:8080/java-app/"
+
+      # 16. Delete temporary key
+      - name: Delete temporary key
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: devopsproject-war
-          path: target/*.war
-          if-no-files-found: error
+        run: rm -f key.pem

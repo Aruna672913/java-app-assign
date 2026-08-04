@@ -14,8 +14,7 @@ env:
   EC2_USER: ec2-user
   WAR_FILE: target/devopsproject.war
   APP_NAME: devopsproject
-  TOMCAT_VERSION: 10.1.57
-  HTTPS_PORT: "8443"
+  TOMCAT_PORT: "8080"
 
 jobs:
   build-and-deploy:
@@ -23,13 +22,13 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Java 17
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
         with:
           distribution: temurin
           java-version: "17"
@@ -42,7 +41,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f "$WAR_FILE"
+
+          if [ ! -f "$WAR_FILE" ]; then
+            echo "WAR file not found: $WAR_FILE"
+            exit 1
+          fi
+
           echo "WAR created: $WAR_FILE"
 
       - name: SonarCloud scan
@@ -56,7 +60,7 @@ jobs:
             -Dsonar.host.url=https://sonarcloud.io
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -78,9 +82,11 @@ jobs:
 
           if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No existing EC2 found"
           else
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+            echo "Existing EC2 found: $INSTANCE_ID"
           fi
 
       - name: Create EC2
@@ -92,10 +98,20 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ -z "$AWS_KEY_NAME" ]; then
+            echo "AWS_KEY_NAME is empty"
+            exit 1
+          fi
+
           VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=is-default,Values=true" \
             --query "Vpcs[0].VpcId" \
             --output text)
+
+          if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+            echo "Default VPC not found"
+            exit 1
+          fi
 
           SUBNET_ID=$(aws ec2 describe-subnets \
             --filters \
@@ -103,6 +119,11 @@ jobs:
               "Name=default-for-az,Values=true" \
             --query "Subnets[0].SubnetId" \
             --output text)
+
+          if [ "$SUBNET_ID" = "None" ] || [ -z "$SUBNET_ID" ]; then
+            echo "Default subnet not found"
+            exit 1
+          fi
 
           SG_ID=$(aws ec2 describe-security-groups \
             --filters \
@@ -114,7 +135,7 @@ jobs:
           if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
             SG_ID=$(aws ec2 create-security-group \
               --group-name java-app-sg \
-              --description "Java Tomcat HTTPS security group" \
+              --description "Java Tomcat POC security group" \
               --vpc-id "$VPC_ID" \
               --query "GroupId" \
               --output text)
@@ -131,7 +152,7 @@ jobs:
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
             --protocol tcp \
-            --port "$HTTPS_PORT" \
+            --port "$TOMCAT_PORT" \
             --cidr 0.0.0.0/0 || true
 
           AMI_ID=$(aws ec2 describe-images \
@@ -142,6 +163,11 @@ jobs:
               "Name=state,Values=available" \
             --query "sort_by(Images,&CreationDate)[-1].ImageId" \
             --output text)
+
+          if [ "$AMI_ID" = "None" ] || [ -z "$AMI_ID" ]; then
+            echo "Amazon Linux 2023 AMI not found"
+            exit 1
+          fi
 
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "$AMI_ID" \
@@ -178,16 +204,32 @@ jobs:
             --query "Reservations[0].Instances[0].State.Name" \
             --output text)
 
+          if [ "$STATE" = "stopping" ]; then
+            aws ec2 wait instance-stopped \
+              --instance-ids "$INSTANCE_ID"
+            STATE="stopped"
+          fi
+
           if [ "$STATE" = "stopped" ]; then
-            aws ec2 start-instances --instance-ids "$INSTANCE_ID"
-            aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-            aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
+            aws ec2 start-instances \
+              --instance-ids "$INSTANCE_ID"
+
+            aws ec2 wait instance-running \
+              --instance-ids "$INSTANCE_ID"
+
+            aws ec2 wait instance-status-ok \
+              --instance-ids "$INSTANCE_ID"
           fi
 
           PUBLIC_IP=$(aws ec2 describe-instances \
             --instance-ids "$INSTANCE_ID" \
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)
+
+          if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
+            echo "EC2 has no public IP"
+            exit 1
+          fi
 
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
           echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
@@ -196,6 +238,7 @@ jobs:
         shell: bash
         run: |
           INSTANCE_ID="${{ steps.server.outputs.instance_id }}"
+
           SG_ID=$(aws ec2 describe-instances \
             --instance-ids "$INSTANCE_ID" \
             --query "Reservations[0].Instances[0].SecurityGroups[0].GroupId" \
@@ -212,7 +255,7 @@ jobs:
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
             --protocol tcp \
-            --port "$HTTPS_PORT" \
+            --port "$TOMCAT_PORT" \
             --cidr 0.0.0.0/0 || true
 
       - name: Prepare SSH key
@@ -221,6 +264,12 @@ jobs:
           EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
         run: |
           set -euo pipefail
+
+          if [ -z "$EC2_PRIVATE_KEY" ]; then
+            echo "EC2_PRIVATE_KEY is empty"
+            exit 1
+          fi
+
           printf '%s\n' "$EC2_PRIVATE_KEY" > key.pem
           chmod 600 key.pem
 
@@ -238,12 +287,14 @@ jobs:
               exit 0
             fi
 
+            echo "Waiting for SSH..."
             sleep 20
           done
 
+          echo "SSH connection failed"
           exit 1
 
-      - name: Install Java and Tomcat HTTPS
+      - name: Install Java and Tomcat
         shell: bash
         run: |
           ssh \
@@ -258,8 +309,6 @@ jobs:
           TOMCAT_VERSION="10.1.57"
           TOMCAT_FILE="/tmp/tomcat.tar.gz"
           TOMCAT_URL="https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz"
-          KEYSTORE="/opt/tomcat/conf/tomcat.p12"
-          KEYSTORE_PASSWORD="changeit"
 
           dnf install -y \
             java-17-amazon-corretto-devel \
@@ -270,38 +319,27 @@ jobs:
             rm -rf /opt/tomcat
             rm -f "$TOMCAT_FILE"
 
-            wget -q -O "$TOMCAT_FILE" "$TOMCAT_URL"
+            wget -q \
+              -O "$TOMCAT_FILE" \
+              "$TOMCAT_URL"
+
             tar -tzf "$TOMCAT_FILE" >/dev/null
 
             mkdir -p /opt/tomcat
-            tar -xzf "$TOMCAT_FILE" \
+
+            tar \
+              -xzf "$TOMCAT_FILE" \
               -C /opt/tomcat \
               --strip-components=1
           fi
 
+          if [ ! -f /opt/tomcat/bin/startup.sh ]; then
+            echo "Tomcat installation failed"
+            exit 1
+          fi
+
           chmod +x /opt/tomcat/bin/*.sh
-
-          if [ ! -f "$KEYSTORE" ]; then
-            keytool -genkeypair \
-              -alias tomcat \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 365 \
-              -storetype PKCS12 \
-              -keystore "$KEYSTORE" \
-              -storepass "$KEYSTORE_PASSWORD" \
-              -keypass "$KEYSTORE_PASSWORD" \
-              -dname "CN=localhost, OU=POC, O=JavaApp, L=NA, ST=NA, C=US"
-          fi
-
-          if ! grep -q 'port="8443"' /opt/tomcat/conf/server.xml; then
-            sed -i '/<\/Service>/i\
-              <Connector port="8443" protocol="org.apache.coyote.http11.Http11NioProtocol" maxThreads="150" SSLEnabled="true">\
-                <SSLHostConfig>\
-                  <Certificate certificateKeystoreFile="conf/tomcat.p12" certificateKeystorePassword="changeit" type="RSA" />\
-                </SSLHostConfig>\
-              </Connector>' /opt/tomcat/conf/server.xml
-          fi
+          echo "Tomcat installation successful"
 
           REMOTE
 
@@ -342,23 +380,27 @@ jobs:
             "/opt/tomcat/webapps/${APP_NAME}.war"
 
           /opt/tomcat/bin/startup.sh
+          sleep 10
+
+          ss -ltnp | grep 8080
 
           REMOTE
 
-      - name: Verify HTTPS application
+      - name: Verify application
         shell: bash
         run: |
-          URL="https://${{ steps.server.outputs.public_ip }}:$HTTPS_PORT/$APP_NAME/"
+          URL="http://${{ steps.server.outputs.public_ip }}:$TOMCAT_PORT/$APP_NAME/"
+
+          echo "Checking: $URL"
 
           for attempt in {1..30}; do
             STATUS=$(curl \
-              --insecure \
               --silent \
               --output /dev/null \
               --write-out "%{http_code}" \
               "$URL" || true)
 
-            echo "Attempt $attempt: HTTPS $STATUS"
+            echo "Attempt $attempt: HTTP $STATUS"
 
             if [ "$STATUS" = "200" ]; then
               echo "Application deployed successfully"
@@ -369,6 +411,7 @@ jobs:
             sleep 10
           done
 
+          echo "Application verification failed"
           exit 1
 
       - name: Delete temporary SSH key

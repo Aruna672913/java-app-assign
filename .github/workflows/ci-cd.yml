@@ -20,11 +20,13 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Download source code
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
+      # Install Java 17 on GitHub runner
       - name: Setup Java
         uses: actions/setup-java@v5
         with:
@@ -32,11 +34,14 @@ jobs:
           java-version: "17"
           cache: maven
 
+      # Build the WAR file
       - name: Build WAR
         run: |
           mvn -B clean package
           test -f "$WAR_FILE"
 
+      # Run SonarCloud scan
+      # Quality Gate failure will not stop deployment
       - name: SonarCloud scan
         continue-on-error: true
         env:
@@ -49,6 +54,7 @@ jobs:
             -Dsonar.projectKey=Aruna672913_java-app-assign \
             -Dsonar.host.url=https://sonarcloud.io
 
+      # Login to AWS
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -56,31 +62,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION }}
 
-      - name: Allow GitHub runner SSH
-        id: runner
-        env:
-          SECURITY_GROUP_ID: ${{ vars.SECURITY_GROUP_ID || secrets.SECURITY_GROUP_ID }}
-        run: |
-          RUNNER_IP=$(curl -fsS https://checkip.amazonaws.com |
-            tr -d '[:space:]')
-
-          echo "GitHub runner IP: $RUNNER_IP"
-          echo "ip=$RUNNER_IP" >> "$GITHUB_OUTPUT"
-
-          if ! aws ec2 authorize-security-group-ingress \
-            --group-id "$SECURITY_GROUP_ID" \
-            --protocol tcp \
-            --port 22 \
-            --cidr "$RUNNER_IP/32" 2>sg-error.txt
-          then
-            if grep -q "InvalidPermission.Duplicate" sg-error.txt; then
-              echo "SSH rule already exists"
-            else
-              cat sg-error.txt
-              exit 1
-            fi
-          fi
-
+      # Find existing EC2 or create new EC2
       - name: Find or create EC2
         id: ec2
         env:
@@ -91,11 +73,11 @@ jobs:
         run: |
           set -e
 
-          if [ -z "$VPC_ID" ] ||
-             [ -z "$SUBNET_ID" ] ||
-             [ -z "$SECURITY_GROUP_ID" ] ||
+          if [ -z "$VPC_ID" ] || \
+             [ -z "$SUBNET_ID" ] || \
+             [ -z "$SECURITY_GROUP_ID" ] || \
              [ -z "$AWS_KEY_NAME" ]; then
-            echo "AWS network value or key name is missing"
+            echo "AWS network details or key name are missing"
             exit 1
           fi
 
@@ -107,18 +89,22 @@ jobs:
             --query "Reservations[].Instances[].InstanceId | [0]" \
             --output text)
 
-          if [ "$INSTANCE_ID" = "None" ] ||
-             [ -z "$INSTANCE_ID" ]; then
-
+          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
             echo "Creating new EC2 instance"
 
             AMI_ID=$(aws ec2 describe-images \
               --owners amazon \
               --filters \
                 "Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64" \
+                "Name=architecture,Values=x86_64" \
                 "Name=state,Values=available" \
               --query "sort_by(Images,&CreationDate)[-1].ImageId" \
               --output text)
+
+            if [ "$AMI_ID" = "None" ] || [ -z "$AMI_ID" ]; then
+              echo "Amazon Linux AMI was not found"
+              exit 1
+            fi
 
             INSTANCE_ID=$(aws ec2 run-instances \
               --image-id "$AMI_ID" \
@@ -132,10 +118,10 @@ jobs:
               --query "Instances[0].InstanceId" \
               --output text)
 
-            echo "Created EC2: $INSTANCE_ID"
+            echo "New EC2 created: $INSTANCE_ID"
 
           else
-            echo "Using existing EC2: $INSTANCE_ID"
+            echo "Existing EC2 found: $INSTANCE_ID"
 
             STATE=$(aws ec2 describe-instances \
               --instance-ids "$INSTANCE_ID" \
@@ -166,8 +152,7 @@ jobs:
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)
 
-          if [ "$PUBLIC_IP" = "None" ] ||
-             [ -z "$PUBLIC_IP" ]; then
+          if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
             echo "EC2 does not have a public IP"
             exit 1
           fi
@@ -175,7 +160,8 @@ jobs:
           echo "ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
           echo "EC2 Public IP: $PUBLIC_IP"
 
-      - name: Deploy application
+      # Create the SSH private-key file
+      - name: Prepare SSH key
         env:
           EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
         run: |
@@ -187,6 +173,9 @@ jobs:
           printf '%s\n' "$EC2_PRIVATE_KEY" > key.pem
           chmod 600 key.pem
 
+      # Wait until SSH is available
+      - name: Wait for EC2
+        run: |
           IP="${{ steps.ec2.outputs.ip }}"
 
           for attempt in {1..30}; do
@@ -197,44 +186,49 @@ jobs:
               "$EC2_USER@$IP" \
               "echo connected"
             then
-              echo "SSH connected"
-              break
-            fi
-
-            if [ "$attempt" = "30" ]; then
-              echo "SSH connection failed"
-              echo "Check subnet route: 0.0.0.0/0 to Internet Gateway"
-              exit 1
+              echo "SSH connection successful"
+              exit 0
             fi
 
             echo "Waiting for EC2 SSH..."
             sleep 10
           done
 
+          echo "Unable to connect to EC2"
+          exit 1
+
+      # Copy WAR file to EC2
+      - name: Copy WAR
+        run: |
           scp \
             -o StrictHostKeyChecking=no \
             -i key.pem \
             "$WAR_FILE" \
-            "$EC2_USER@$IP:/tmp/$APP_NAME.war"
+            "$EC2_USER@${{ steps.ec2.outputs.ip }}:/tmp/$APP_NAME.war"
 
+      # Install Java and Tomcat, then deploy the WAR
+      - name: Deploy application
+        run: |
           ssh \
             -o StrictHostKeyChecking=no \
             -i key.pem \
-            "$EC2_USER@$IP" \
+            "$EC2_USER@${{ steps.ec2.outputs.ip }}" \
             "sudo bash -s -- '$APP_NAME'" <<'REMOTE'
 
           set -e
 
           APP_NAME="$1"
+          TOMCAT_VERSION="9.0.120"
 
+          # Do not install full curl.
+          # Amazon Linux already contains curl-minimal.
           dnf install -y \
             java-17-amazon-corretto-headless \
-            curl \
             tar
 
           if [ ! -x /opt/tomcat/bin/startup.sh ]; then
             curl -fsSL \
-              https://archive.apache.org/dist/tomcat/tomcat-9/v9.0.120/bin/apache-tomcat-9.0.120.tar.gz \
+              "https://archive.apache.org/dist/tomcat/tomcat-9/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz" \
               -o /tmp/tomcat.tar.gz
 
             mkdir -p /opt/tomcat
@@ -259,6 +253,7 @@ jobs:
 
           REMOTE
 
+      # Verify the public application URL
       - name: Verify deployment
         run: |
           URL="http://${{ steps.ec2.outputs.ip }}:$TOMCAT_PORT/$APP_NAME/"
@@ -272,25 +267,10 @@ jobs:
 
           echo "Application deployed successfully"
           echo "Application URL: $URL"
-
           echo "Application URL: [$URL]($URL)" \
             >> "$GITHUB_STEP_SUMMARY"
 
+      # Remove the private key from GitHub runner
       - name: Cleanup
         if: always()
-        env:
-          SECURITY_GROUP_ID: ${{ vars.SECURITY_GROUP_ID || secrets.SECURITY_GROUP_ID }}
-        run: |
-          rm -f key.pem sg-error.txt
-
-          RUNNER_IP="${{ steps.runner.outputs.ip }}"
-
-          if [ -n "$RUNNER_IP" ] &&
-             [ -n "$SECURITY_GROUP_ID" ]; then
-
-            aws ec2 revoke-security-group-ingress \
-              --group-id "$SECURITY_GROUP_ID" \
-              --protocol tcp \
-              --port 22 \
-              --cidr "$RUNNER_IP/32" 2>/dev/null || true
-          fi
+        run: rm -f key.pem

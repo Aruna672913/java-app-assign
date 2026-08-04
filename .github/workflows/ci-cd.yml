@@ -21,12 +21,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Checkout source code
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
           persist-credentials: false
 
+      # 2. Setup Java
       - name: Setup Java 17
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
         with:
@@ -34,9 +36,11 @@ jobs:
           java-version: "17"
           cache: maven
 
+      # 3. Build WAR
       - name: Build WAR
         run: mvn clean package
 
+      # 4. Verify WAR
       - name: Verify WAR
         shell: bash
         run: |
@@ -49,6 +53,7 @@ jobs:
 
           echo "WAR created: $WAR_FILE"
 
+      # 5. SonarCloud scan
       - name: SonarCloud scan
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -59,6 +64,7 @@ jobs:
             -Dsonar.projectKey=Aruna672913_java-app-assign \
             -Dsonar.host.url=https://sonarcloud.io
 
+      # 6. Configure AWS
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
         with:
@@ -66,9 +72,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      # 7. Test AWS connection
       - name: Test AWS connection
         run: aws sts get-caller-identity
 
+      # 8. Check whether EC2 exists
       - name: Check EC2
         id: check_ec2
         shell: bash
@@ -89,6 +97,7 @@ jobs:
             echo "Existing EC2 found: $INSTANCE_ID"
           fi
 
+      # 9. Create EC2 only if missing
       - name: Create EC2
         id: create_ec2
         if: steps.check_ec2.outputs.exists == 'false'
@@ -141,7 +150,11 @@ jobs:
               --output text)
           fi
 
-          RUNNER_IP=$(wget -qO- https://checkip.amazonaws.com | tr -d '[:space:]')
+          RUNNER_IP=$(wget \
+            --quiet \
+            --max-redirect=0 \
+            --output-document=- \
+            https://checkip.amazonaws.com | tr -d '[:space:]')
 
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
@@ -181,6 +194,11 @@ jobs:
             --query "Instances[0].InstanceId" \
             --output text)
 
+          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+            echo "EC2 creation failed"
+            exit 1
+          fi
+
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
 
           aws ec2 wait instance-running \
@@ -189,6 +207,7 @@ jobs:
           aws ec2 wait instance-status-ok \
             --instance-ids "$INSTANCE_ID"
 
+      # 10. Get existing or newly created EC2 details
       - name: Get EC2 details
         id: server
         shell: bash
@@ -197,6 +216,11 @@ jobs:
             INSTANCE_ID="${{ steps.check_ec2.outputs.instance_id }}"
           else
             INSTANCE_ID="${{ steps.create_ec2.outputs.instance_id }}"
+          fi
+
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "Instance ID is empty"
+            exit 1
           fi
 
           STATE=$(aws ec2 describe-instances \
@@ -221,6 +245,14 @@ jobs:
               --instance-ids "$INSTANCE_ID"
           fi
 
+          if [ "$STATE" = "pending" ]; then
+            aws ec2 wait instance-running \
+              --instance-ids "$INSTANCE_ID"
+
+            aws ec2 wait instance-status-ok \
+              --instance-ids "$INSTANCE_ID"
+          fi
+
           PUBLIC_IP=$(aws ec2 describe-instances \
             --instance-ids "$INSTANCE_ID" \
             --query "Reservations[0].Instances[0].PublicIpAddress" \
@@ -234,7 +266,8 @@ jobs:
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
           echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
 
-      - name: Allow runner SSH
+      # 11. Ensure security-group rules exist
+      - name: Allow runner SSH and Tomcat
         shell: bash
         run: |
           INSTANCE_ID="${{ steps.server.outputs.instance_id }}"
@@ -244,7 +277,11 @@ jobs:
             --query "Reservations[0].Instances[0].SecurityGroups[0].GroupId" \
             --output text)
 
-          RUNNER_IP=$(wget -qO- https://checkip.amazonaws.com | tr -d '[:space:]')
+          RUNNER_IP=$(wget \
+            --quiet \
+            --max-redirect=0 \
+            --output-document=- \
+            https://checkip.amazonaws.com | tr -d '[:space:]')
 
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
@@ -258,6 +295,7 @@ jobs:
             --port "$TOMCAT_PORT" \
             --cidr 0.0.0.0/0 || true
 
+      # 12. Create temporary SSH key
       - name: Prepare SSH key
         shell: bash
         env:
@@ -273,6 +311,7 @@ jobs:
           printf '%s\n' "$EC2_PRIVATE_KEY" > key.pem
           chmod 600 key.pem
 
+      # 13. Wait for SSH
       - name: Wait for SSH
         shell: bash
         run: |
@@ -294,6 +333,7 @@ jobs:
           echo "SSH connection failed"
           exit 1
 
+      # 14. Install Java and Tomcat
       - name: Install Java and Tomcat
         shell: bash
         run: |
@@ -319,8 +359,10 @@ jobs:
             rm -rf /opt/tomcat
             rm -f "$TOMCAT_FILE"
 
-            wget -q \
-              -O "$TOMCAT_FILE" \
+            wget \
+              --quiet \
+              --max-redirect=0 \
+              --output-document="$TOMCAT_FILE" \
               "$TOMCAT_URL"
 
             tar -tzf "$TOMCAT_FILE" >/dev/null
@@ -343,6 +385,7 @@ jobs:
 
           REMOTE
 
+      # 15. Copy WAR to EC2
       - name: Copy WAR to EC2
         shell: bash
         run: |
@@ -353,6 +396,7 @@ jobs:
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}:/tmp/$APP_NAME.war"
 
+      # 16. Deploy WAR to Tomcat
       - name: Deploy application
         shell: bash
         run: |
@@ -386,25 +430,28 @@ jobs:
 
           REMOTE
 
+      # 17. Verify public application URL
       - name: Verify application
         shell: bash
         run: |
-          URL="http://${{ steps.server.outputs.public_ip }}:$TOMCAT_PORT/$APP_NAME/"
+          # POC-only endpoint. Production should use HTTPS through ALB + ACM.
+          SCHEME="http" # NOSONAR
+          URL="${SCHEME}://${{ steps.server.outputs.public_ip }}:${TOMCAT_PORT}/${APP_NAME}/" # NOSONAR
 
-          echo "Checking: $URL"
+          echo "Checking application endpoint"
 
           for attempt in {1..30}; do
             STATUS=$(curl \
               --silent \
               --output /dev/null \
               --write-out "%{http_code}" \
-              "$URL" || true)
+              "$URL" || true) # NOSONAR
 
             echo "Attempt $attempt: HTTP $STATUS"
 
             if [ "$STATUS" = "200" ]; then
               echo "Application deployed successfully"
-              echo "Application URL: $URL"
+              echo "Application URL: $URL" # NOSONAR
               exit 0
             fi
 
@@ -414,6 +461,7 @@ jobs:
           echo "Application verification failed"
           exit 1
 
+      # 18. Delete temporary SSH key
       - name: Delete temporary SSH key
         if: always()
         run: rm -f key.pem

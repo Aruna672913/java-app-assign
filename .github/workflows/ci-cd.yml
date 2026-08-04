@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       # 1. Download source code
       - name: Checkout code
         uses: actions/checkout@v6
@@ -32,11 +33,11 @@ jobs:
           java-version: "17"
           cache: maven
 
-      # 3. Build the WAR file
+      # 3. Build the application
       - name: Build WAR
         run: mvn clean package
 
-      # 4. Verify the WAR exists
+      # 4. Verify the WAR file
       - name: Verify WAR
         shell: bash
         run: |
@@ -47,7 +48,7 @@ jobs:
             exit 1
           fi
 
-          echo "WAR file created: $WAR_FILE"
+          echo "WAR file created successfully: $WAR_FILE"
 
       # 5. Run SonarCloud scan
       - name: SonarCloud scan
@@ -68,11 +69,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # 7. Verify AWS authentication
+      # 7. Verify AWS login
       - name: Test AWS connection
         run: aws sts get-caller-identity
 
-      # 8. Check whether EC2 exists
+      # 8. Check whether EC2 already exists
       - name: Check EC2
         id: check_ec2
         shell: bash
@@ -86,14 +87,14 @@ jobs:
 
           if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "EC2 does not exist. A new instance will be created."
+            echo "EC2 does not exist. Creating a new EC2 instance."
           else
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
             echo "Existing EC2 found: $INSTANCE_ID"
           fi
 
-      # 9. Create EC2 only when missing
+      # 9. Create EC2 only if it does not exist
       - name: Create EC2
         id: create_ec2
         if: steps.check_ec2.outputs.exists == 'false'
@@ -141,6 +142,7 @@ jobs:
             --output text)
 
           if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+
             echo "Creating security group..."
 
             SG_ID=$(aws ec2 create-security-group \
@@ -149,6 +151,7 @@ jobs:
               --vpc-id "$VPC_ID" \
               --query "GroupId" \
               --output text)
+
           fi
 
           echo "Security group: $SG_ID"
@@ -167,7 +170,7 @@ jobs:
             --port 8080 \
             --cidr 0.0.0.0/0 || true
 
-          echo "Finding Amazon Linux AMI..."
+          echo "Finding Amazon Linux 2023 AMI..."
 
           AMI_ID=$(aws ec2 describe-images \
             --owners amazon \
@@ -179,19 +182,23 @@ jobs:
             --output text)
 
           if [ "$AMI_ID" = "None" ] || [ -z "$AMI_ID" ]; then
-            echo "Amazon Linux AMI not found"
+            echo "Amazon Linux 2023 AMI not found"
             exit 1
           fi
 
           echo "AMI ID: $AMI_ID"
 
-          # Install Java and Tomcat during EC2 startup
+          # Install Java and Tomcat while EC2 starts
           cat > user-data.sh <<EOF
           #!/bin/bash
           set -e
 
           dnf update -y
-          dnf install -y java-17-amazon-corretto-devel wget tar
+
+          dnf install -y \
+            java-17-amazon-corretto-devel \
+            wget \
+            tar
 
           rm -rf /opt/tomcat
           rm -rf /opt/apache-tomcat-${TOMCAT_VERSION}
@@ -214,7 +221,7 @@ jobs:
           /opt/tomcat/bin/startup.sh
           EOF
 
-          echo "Creating EC2 instance..."
+          echo "Creating EC2..."
 
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "$AMI_ID" \
@@ -253,7 +260,7 @@ jobs:
             echo "Using existing EC2: $INSTANCE_ID"
           else
             INSTANCE_ID="${{ steps.create_ec2.outputs.instance_id }}"
-            echo "Using new EC2: $INSTANCE_ID"
+            echo "Using newly created EC2: $INSTANCE_ID"
           fi
 
           STATE=$(aws ec2 describe-instances \
@@ -295,7 +302,7 @@ jobs:
             --output text)
 
           if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
-            echo "EC2 does not have a public IP"
+            echo "EC2 has no public IP"
             exit 1
           fi
 
@@ -305,7 +312,7 @@ jobs:
           echo "Instance ID: $INSTANCE_ID"
           echo "Public IP: $PUBLIC_IP"
 
-      # 11. Create temporary SSH key
+      # 11. Create temporary PEM file
       - name: Prepare SSH key
         shell: bash
         run: |
@@ -317,11 +324,12 @@ jobs:
             exit 1
           fi
 
-      # 12. Wait until EC2 SSH is available
+      # 12. Wait until SSH is available
       - name: Wait for SSH
         shell: bash
         run: |
           for attempt in {1..30}; do
+
             echo "SSH attempt: $attempt"
 
             if ssh \
@@ -332,12 +340,13 @@ jobs:
               "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
               "echo SSH connected"; then
 
-              echo "SSH is ready"
+              echo "SSH connection successful"
               exit 0
             fi
 
             echo "Waiting for SSH..."
             sleep 20
+
           done
 
           echo "SSH connection failed"
@@ -363,15 +372,17 @@ jobs:
                 tar
 
               if [ ! -f /opt/tomcat/bin/startup.sh ]; then
+
                 echo "Installing Tomcat..."
 
                 sudo rm -rf /opt/tomcat
                 sudo rm -rf /opt/apache-tomcat-${TOMCAT_VERSION}
 
-                # Fixes the previous permission-denied issue
+                # Remove old protected archive
                 sudo rm -f \
                   /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz
 
+                # Download with root permission
                 sudo wget \
                   -O /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz \
                   https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
@@ -383,6 +394,7 @@ jobs:
                 sudo mv \
                   /opt/apache-tomcat-${TOMCAT_VERSION} \
                   /opt/tomcat
+
               fi
 
               if [ ! -f /opt/tomcat/bin/startup.sh ]; then
@@ -407,7 +419,7 @@ jobs:
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}:/tmp/$APP_NAME.war"
 
-      # 15. Deploy WAR into Tomcat
+      # 15. Deploy WAR to Tomcat
       - name: Deploy application
         shell: bash
         run: |
@@ -440,16 +452,16 @@ jobs:
 
           EOF
 
-      # 16. Verify application
+      # 16. Verify application URL
       - name: Verify application
         shell: bash
         run: |
           URL="http://${{ steps.server.outputs.public_ip }}:8080/${APP_NAME}/"
 
-          echo "Checking application URL:"
-          echo "$URL"
+          echo "Checking URL: $URL"
 
           for attempt in {1..20}; do
+
             STATUS=$(curl \
               --silent \
               --output /dev/null \
@@ -465,12 +477,13 @@ jobs:
             fi
 
             sleep 10
+
           done
 
           echo "Application verification failed"
           exit 1
 
-      # 17. Delete temporary SSH key
+      # 17. Delete temporary key
       - name: Delete temporary SSH key
         if: always()
         run: rm -f key.pem

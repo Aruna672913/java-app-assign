@@ -1,4 +1,4 @@
-name: Java CI/CD
+  name: Java CI/CD
 
 on:
   push:
@@ -28,16 +28,15 @@ jobs:
       - name: Build WAR
         run: mvn clean package
 
-      # 4. Run SonarCloud scan
-      - name: SonarCloud scan
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: |
-          mvn sonar:sonar \
-            -Dsonar.token="$SONAR_TOKEN" \
-            -Dsonar.organization=aruna672913 \
-            -Dsonar.projectKey=Aruna672913_java-app-assign \
-            -Dsonar.host.url=https://sonarcloud.io
+    - name: SonarCloud Scan
+  env:
+    SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  run: |
+    mvn org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+      -Dsonar.token=${SONAR_TOKEN} \
+      -Dsonar.organization=aruna672913 \
+      -Dsonar.projectKey=Aruna672913_java-app-assign \
+      -Dsonar.host.url=https://sonarcloud.io
 
       # 5. Connect GitHub Actions to AWS
       - name: Configure AWS

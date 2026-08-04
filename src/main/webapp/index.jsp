@@ -1,10 +1,14 @@
-        <html lang="en">
-        <head>
-            <meta charset="UTF=8">
-            <title>Simple Java Application</title>
-        </head>
-        <body>
-            <h1>Hello from Java!</h1>
-            <p>The application will be deployed on Tomcat using Github Actions. </p>
-        </body>
-        </html> 
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Java DevOps Project</title>
+</head>
+<body>
+    <main>
+        <h1>Java application deployed successfully</h1>
+        <p>Deployed automatically using GitHub Actions, AWS EC2 and Tomcat.</p>
+    </main>
+</body>
+</html>

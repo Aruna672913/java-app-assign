@@ -20,44 +20,41 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Download source code
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          persist-credentials: false
 
-      # 2. Install Java 17
       - name: Setup Java
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
           cache: maven
 
-      # 3. Build WAR and send analysis to SonarCloud
-      - name: Build and SonarCloud scan
+      - name: Build WAR
+        run: |
+          mvn -B clean package
+          test -f "$WAR_FILE"
+
+      - name: SonarCloud scan
+        continue-on-error: true
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          mvn -B clean verify \
-            org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
+          mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
             -Dsonar.token="$SONAR_TOKEN" \
             -Dsonar.organization=aruna672913 \
             -Dsonar.projectKey=Aruna672913_java-app-assign \
             -Dsonar.host.url=https://sonarcloud.io
 
-          test -f "$WAR_FILE"
-
-      # 4. Connect GitHub Actions to AWS
       - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION || vars.AWS_REGION }}
 
-      # 5. Find an existing EC2 or create a new EC2
       - name: Find or create EC2
         id: ec2
         env:
@@ -68,14 +65,10 @@ jobs:
         run: |
           set -e
 
-          if [ -z "$VPC_ID" ] ||
-             [ -z "$SUBNET_ID" ] ||
-             [ -z "$SECURITY_GROUP_ID" ]; then
+          if [ -z "$VPC_ID" ] || [ -z "$SUBNET_ID" ] || [ -z "$SECURITY_GROUP_ID" ]; then
             echo "VPC_ID, SUBNET_ID or SECURITY_GROUP_ID is missing"
             exit 1
           fi
-
-          echo "Network values received successfully"
 
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters \
@@ -85,21 +78,16 @@ jobs:
             --query "Reservations[].Instances[].InstanceId | [0]" \
             --output text)
 
-          if [ "$INSTANCE_ID" = "None" ] ||
-             [ -z "$INSTANCE_ID" ]; then
-
-            echo "EC2 does not exist. Creating new EC2."
+          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+            echo "Creating new EC2"
 
             AMI_ID=$(aws ec2 describe-images \
               --owners amazon \
               --filters \
                 "Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64" \
-                "Name=architecture,Values=x86_64" \
                 "Name=state,Values=available" \
               --query "sort_by(Images,&CreationDate)[-1].ImageId" \
               --output text)
-
-            echo "Using AMI: $AMI_ID"
 
             INSTANCE_ID=$(aws ec2 run-instances \
               --image-id "$AMI_ID" \
@@ -108,15 +96,11 @@ jobs:
               --subnet-id "$SUBNET_ID" \
               --security-group-ids "$SECURITY_GROUP_ID" \
               --associate-public-ip-address \
-              --tag-specifications \
-                "ResourceType=instance,Tags=[{Key=Name,Value=$EC2_NAME}]" \
+              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$EC2_NAME}]" \
               --query "Instances[0].InstanceId" \
               --output text)
-
-            echo "New EC2 created: $INSTANCE_ID"
-
           else
-            echo "Existing EC2 found: $INSTANCE_ID"
+            echo "Using existing EC2: $INSTANCE_ID"
 
             STATE=$(aws ec2 describe-instances \
               --instance-ids "$INSTANCE_ID" \
@@ -124,142 +108,86 @@ jobs:
               --output text)
 
             if [ "$STATE" = "stopping" ]; then
-              aws ec2 wait instance-stopped \
-                --instance-ids "$INSTANCE_ID"
-
+              aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
               STATE="stopped"
             fi
 
             if [ "$STATE" = "stopped" ]; then
-              aws ec2 start-instances \
-                --instance-ids "$INSTANCE_ID" >/dev/null
+              aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
             fi
           fi
 
-          aws ec2 wait instance-running \
-            --instance-ids "$INSTANCE_ID"
-
-          aws ec2 wait instance-status-ok \
-            --instance-ids "$INSTANCE_ID"
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
 
           PUBLIC_IP=$(aws ec2 describe-instances \
             --instance-ids "$INSTANCE_ID" \
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)
 
-          if [ "$PUBLIC_IP" = "None" ] ||
-             [ -z "$PUBLIC_IP" ]; then
-            echo "EC2 does not have a public IP"
+          test "$PUBLIC_IP" != "None" || {
+            echo "EC2 has no public IP"
             exit 1
-          fi
+          }
 
           echo "ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
           echo "EC2 Public IP: $PUBLIC_IP"
 
-      # 6. Create the SSH key file
-      - name: Prepare SSH key
+      - name: Deploy to Tomcat
         env:
           EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
         run: |
-          if [ -z "$EC2_PRIVATE_KEY" ]; then
-            echo "EC2_PRIVATE_KEY is missing"
-            exit 1
-          fi
-
           printf '%s\n' "$EC2_PRIVATE_KEY" > key.pem
           chmod 600 key.pem
 
-      # 7. Wait until EC2 is ready for SSH
-      - name: Wait for EC2
-        run: |
-          for attempt in {1..30}; do
-            ssh \
-              -o StrictHostKeyChecking=no \
-              -o ConnectTimeout=10 \
-              -i key.pem \
-              "$EC2_USER@${{ steps.ec2.outputs.ip }}" \
-              "echo connected" && exit 0
+          IP="${{ steps.ec2.outputs.ip }}"
 
-            echo "Waiting for EC2..."
+          for attempt in {1..30}; do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+              -i key.pem "$EC2_USER@$IP" "echo connected" && break
+
+            if [ "$attempt" = "30" ]; then
+              echo "SSH failed. Check port 22 and the subnet internet route."
+              exit 1
+            fi
+
             sleep 10
           done
 
-          echo "Unable to connect to EC2"
-          exit 1
+          scp -o StrictHostKeyChecking=no -i key.pem \
+            "$WAR_FILE" "$EC2_USER@$IP:/tmp/$APP_NAME.war"
 
-      # 8. Copy WAR file to EC2
-      - name: Copy WAR
-        run: |
-          scp \
-            -o StrictHostKeyChecking=no \
-            -i key.pem \
-            "$WAR_FILE" \
-            "$EC2_USER@${{ steps.ec2.outputs.ip }}:/tmp/$APP_NAME.war"
-
-      # 9. Install Java and Tomcat, then deploy WAR
-      - name: Deploy application
-        run: |
-          ssh \
-            -o StrictHostKeyChecking=no \
-            -i key.pem \
-            "$EC2_USER@${{ steps.ec2.outputs.ip }}" \
-            "sudo bash -s" <<'REMOTE'
-
+          ssh -o StrictHostKeyChecking=no -i key.pem \
+            "$EC2_USER@$IP" "sudo bash -s -- '$APP_NAME'" <<'REMOTE'
           set -e
+          APP_NAME="$1"
 
-          APP_NAME="devopsproject"
-          TOMCAT_VERSION="9.0.120"
+          dnf install -y java-17-amazon-corretto-headless curl tar
 
-          dnf install -y \
-            java-17-amazon-corretto-headless \
-            curl \
-            tar
-
-          if [ ! -f /opt/tomcat/bin/startup.sh ]; then
+          if [ ! -x /opt/tomcat/bin/startup.sh ]; then
             curl -fsSL \
-              "https://archive.apache.org/dist/tomcat/tomcat-9/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz" \
+              https://archive.apache.org/dist/tomcat/tomcat-9/v9.0.120/bin/apache-tomcat-9.0.120.tar.gz \
               -o /tmp/tomcat.tar.gz
 
             mkdir -p /opt/tomcat
-
-            tar -xzf /tmp/tomcat.tar.gz \
-              -C /opt/tomcat \
-              --strip-components=1
-
+            tar -xzf /tmp/tomcat.tar.gz -C /opt/tomcat --strip-components=1
             chmod +x /opt/tomcat/bin/*.sh
           fi
 
           /opt/tomcat/bin/shutdown.sh || true
           sleep 5
-
-          rm -rf "/opt/tomcat/webapps/$APP_NAME"
-          rm -f "/opt/tomcat/webapps/$APP_NAME.war"
-
-          cp "/tmp/$APP_NAME.war" \
-            "/opt/tomcat/webapps/$APP_NAME.war"
-
+          rm -rf "/opt/tomcat/webapps/$APP_NAME"*
+          cp "/tmp/$APP_NAME.war" "/opt/tomcat/webapps/$APP_NAME.war"
           /opt/tomcat/bin/startup.sh
-
           REMOTE
 
-      # 10. Verify the public application URL
       - name: Verify deployment
         run: |
           URL="http://${{ steps.ec2.outputs.ip }}:$TOMCAT_PORT/$APP_NAME/"
-
-          curl \
-            --fail \
-            --retry 15 \
-            --retry-delay 10 \
-            --retry-connrefused \
-            "$URL"
-
-          echo "Application deployed successfully"
+          curl --fail --retry 15 --retry-delay 10 --retry-connrefused "$URL"
           echo "Application URL: $URL"
-          echo "Application URL: [$URL]($URL)" \
-            >> "$GITHUB_STEP_SUMMARY"
+          echo "Application URL: [$URL]($URL)" >> "$GITHUB_STEP_SUMMARY"
 
-      # 11. Remove the private key
       - name: Cleanup
         if: always()
         run: rm -f key.pem

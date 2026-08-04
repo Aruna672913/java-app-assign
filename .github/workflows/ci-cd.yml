@@ -32,7 +32,7 @@ jobs:
       - name: Build WAR
         run: mvn clean package
 
-      - name: Verify WAR
+      - name: Check WAR
         run: test -f "$WAR_FILE"
 
       - name: SonarCloud scan
@@ -60,8 +60,6 @@ jobs:
           SUBNET_ID: ${{ secrets.SUBNET_ID }}
           SECURITY_GROUP_ID: ${{ secrets.SECURITY_GROUP_ID }}
         run: |
-          set -e
-
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters \
               "Name=tag:Name,Values=$EC2_NAME" \
@@ -70,8 +68,6 @@ jobs:
             --output text)
 
           if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
-            echo "EC2 not found. Creating new EC2."
-
             INSTANCE_ID=$(aws ec2 run-instances \
               --image-id "$AMI_ID" \
               --instance-type t3.micro \
@@ -84,8 +80,6 @@ jobs:
               --query "Instances[0].InstanceId" \
               --output text)
           else
-            echo "Existing EC2 found: $INSTANCE_ID"
-
             STATE=$(aws ec2 describe-instances \
               --instance-ids "$INSTANCE_ID" \
               --query "Reservations[0].Instances[0].State.Name" \
@@ -109,9 +103,8 @@ jobs:
             --output text)
 
           echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
-          echo "EC2 Public IP: $PUBLIC_IP"
 
-      - name: Prepare SSH key
+      - name: Prepare SSH
         env:
           EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
         run: |
@@ -120,48 +113,22 @@ jobs:
 
           mkdir -p "$HOME/.ssh"
 
-          for attempt in {1..30}; do
-            if ssh-keyscan \
-              -T 10 \
+          for attempt in {1..20}; do
+            ssh-keyscan -T 10 \
               -H "${{ steps.ec2.outputs.public_ip }}" \
-              > "$HOME/.ssh/known_hosts" 2>/dev/null; then
-              chmod 600 "$HOME/.ssh/known_hosts"
-              exit 0
-            fi
+              > "$HOME/.ssh/known_hosts" 2>/dev/null && break
 
-            sleep 20
+            sleep 15
           done
-
-          exit 1
-
-      - name: Wait for SSH
-        run: |
-          for attempt in {1..30}; do
-            ssh \
-              -o StrictHostKeyChecking=yes \
-              -o ConnectTimeout=10 \
-              -i key.pem \
-              "$EC2_USER@${{ steps.ec2.outputs.public_ip }}" \
-              "echo connected" && exit 0
-
-            sleep 20
-          done
-
-          exit 1
 
       - name: Install Java and Tomcat
         run: |
-          ssh \
-            -o StrictHostKeyChecking=yes \
+          ssh -o StrictHostKeyChecking=yes \
             -i key.pem \
             "$EC2_USER@${{ steps.ec2.outputs.public_ip }}" \
-            "sudo bash -s" <<'REMOTE'
+            "sudo bash -s" <<'EOF'
 
           set -e
-
-          VERSION="10.1.57"
-          FILE="/tmp/tomcat.tar.gz"
-          URL="https://archive.apache.org/dist/tomcat/tomcat-10/v${VERSION}/bin/apache-tomcat-${VERSION}.tar.gz"
 
           dnf install -y \
             java-17-amazon-corretto-devel \
@@ -170,42 +137,36 @@ jobs:
 
           if [ ! -f /opt/tomcat/bin/startup.sh ]; then
             rm -rf /opt/tomcat
-            rm -f "$FILE"
+            rm -f /tmp/tomcat.tar.gz
 
-            wget \
-              --quiet \
+            wget --quiet \
               --max-redirect=0 \
-              --output-document="$FILE" \
-              "$URL"
+              --output-document=/tmp/tomcat.tar.gz \
+              https://archive.apache.org/dist/tomcat/tomcat-10/v10.1.57/bin/apache-tomcat-10.1.57.tar.gz
 
             mkdir -p /opt/tomcat
 
-            tar -xzf "$FILE" \
+            tar -xzf /tmp/tomcat.tar.gz \
               -C /opt/tomcat \
               --strip-components=1
 
             chmod +x /opt/tomcat/bin/*.sh
           fi
-
-          test -f /opt/tomcat/bin/startup.sh
-
-          REMOTE
+          EOF
 
       - name: Copy WAR
         run: |
-          scp \
-            -o StrictHostKeyChecking=yes \
+          scp -o StrictHostKeyChecking=yes \
             -i key.pem \
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.ec2.outputs.public_ip }}:/tmp/$APP_NAME.war"
 
       - name: Deploy application
         run: |
-          ssh \
-            -o StrictHostKeyChecking=yes \
+          ssh -o StrictHostKeyChecking=yes \
             -i key.pem \
             "$EC2_USER@${{ steps.ec2.outputs.public_ip }}" \
-            "sudo bash -s" <<'REMOTE'
+            "sudo bash -s" <<'EOF'
 
           set -e
 
@@ -220,26 +181,20 @@ jobs:
           cp "/tmp/$APP_NAME.war" \
             "/opt/tomcat/webapps/$APP_NAME.war"
 
-          chmod 644 \
-            "/opt/tomcat/webapps/$APP_NAME.war"
-
           /opt/tomcat/bin/startup.sh
-
-          REMOTE
+          EOF
 
       - name: Verify deployment
         run: |
-          ssh \
-            -o StrictHostKeyChecking=yes \
+          ssh -o StrictHostKeyChecking=yes \
             -i key.pem \
             "$EC2_USER@${{ steps.ec2.outputs.public_ip }}" \
             "sudo test -f /opt/tomcat/webapps/$APP_NAME.war &&
              sudo ss -ltn | grep -q ':8080 '"
 
-          echo "Deployment completed successfully"
           echo "Public IP: ${{ steps.ec2.outputs.public_ip }}"
           echo "Port: 8080"
-          echo "Application path: /$APP_NAME/"
+          echo "Path: /$APP_NAME/"
 
       - name: Cleanup
         if: always()

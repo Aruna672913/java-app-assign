@@ -18,8 +18,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
-      # 1. Download source code
+      # 1. Get source code
       - name: Checkout code
         uses: actions/checkout@v6
         with:
@@ -33,11 +32,11 @@ jobs:
           java-version: "17"
           cache: maven
 
-      # 3. Build the application
+      # 3. Build WAR file
       - name: Build WAR
         run: mvn clean package
 
-      # 4. Verify the WAR file
+      # 4. Verify WAR file
       - name: Verify WAR
         shell: bash
         run: |
@@ -50,7 +49,7 @@ jobs:
 
           echo "WAR file created successfully: $WAR_FILE"
 
-      # 5. Run SonarCloud scan
+      # 5. Run SonarCloud
       - name: SonarCloud scan
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -69,7 +68,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # 7. Verify AWS login
+      # 7. Verify AWS connection
       - name: Test AWS connection
         run: aws sts get-caller-identity
 
@@ -87,7 +86,7 @@ jobs:
 
           if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "EC2 does not exist. Creating a new EC2 instance."
+            echo "EC2 does not exist. A new instance will be created."
           else
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
@@ -142,28 +141,26 @@ jobs:
             --output text)
 
           if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
-
             echo "Creating security group..."
 
             SG_ID=$(aws ec2 create-security-group \
               --group-name java-app-sg \
-              --description "Security group for Java Tomcat application" \
+              --description "Java Tomcat security group" \
               --vpc-id "$VPC_ID" \
               --query "GroupId" \
               --output text)
-
           fi
 
           echo "Security group: $SG_ID"
 
-          # Open SSH port
+          # Allow SSH
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
             --protocol tcp \
             --port 22 \
             --cidr 0.0.0.0/0 || true
 
-          # Open Tomcat port
+          # Allow Tomcat
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
             --protocol tcp \
@@ -182,16 +179,19 @@ jobs:
             --output text)
 
           if [ "$AMI_ID" = "None" ] || [ -z "$AMI_ID" ]; then
-            echo "Amazon Linux 2023 AMI not found"
+            echo "Amazon Linux AMI not found"
             exit 1
           fi
 
           echo "AMI ID: $AMI_ID"
 
-          # Install Java and Tomcat while EC2 starts
+          # Install Java and Tomcat during EC2 startup
           cat > user-data.sh <<EOF
           #!/bin/bash
           set -e
+
+          TOMCAT_VERSION="${TOMCAT_VERSION}"
+          TOMCAT_FILE="/tmp/apache-tomcat-\${TOMCAT_VERSION}.tar.gz"
 
           dnf update -y
 
@@ -201,27 +201,25 @@ jobs:
             tar
 
           rm -rf /opt/tomcat
-          rm -rf /opt/apache-tomcat-${TOMCAT_VERSION}
-          rm -f /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz
+          rm -f "\$TOMCAT_FILE"
 
-          wget \
-            -O /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz \
-            https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
+          mkdir -p /opt/tomcat
+
+          wget -q \
+            -O "\$TOMCAT_FILE" \
+            "https://archive.apache.org/dist/tomcat/tomcat-10/v\${TOMCAT_VERSION}/bin/apache-tomcat-\${TOMCAT_VERSION}.tar.gz"
 
           tar \
-            -xzf /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz \
-            -C /opt
-
-          mv \
-            /opt/apache-tomcat-${TOMCAT_VERSION} \
-            /opt/tomcat
+            -xzf "\$TOMCAT_FILE" \
+            -C /opt/tomcat \
+            --strip-components=1
 
           chmod +x /opt/tomcat/bin/*.sh
 
           /opt/tomcat/bin/startup.sh
           EOF
 
-          echo "Creating EC2..."
+          echo "Creating EC2 instance..."
 
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id "$AMI_ID" \
@@ -261,6 +259,11 @@ jobs:
           else
             INSTANCE_ID="${{ steps.create_ec2.outputs.instance_id }}"
             echo "Using newly created EC2: $INSTANCE_ID"
+          fi
+
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "Instance ID is empty"
+            exit 1
           fi
 
           STATE=$(aws ec2 describe-instances \
@@ -312,7 +315,7 @@ jobs:
           echo "Instance ID: $INSTANCE_ID"
           echo "Public IP: $PUBLIC_IP"
 
-      # 11. Create temporary PEM file
+      # 11. Prepare PEM key
       - name: Prepare SSH key
         shell: bash
         run: |
@@ -324,12 +327,11 @@ jobs:
             exit 1
           fi
 
-      # 12. Wait until SSH is available
+      # 12. Wait for SSH
       - name: Wait for SSH
         shell: bash
         run: |
           for attempt in {1..30}; do
-
             echo "SSH attempt: $attempt"
 
             if ssh \
@@ -346,7 +348,6 @@ jobs:
 
             echo "Waiting for SSH..."
             sleep 20
-
           done
 
           echo "SSH connection failed"
@@ -360,9 +361,12 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -i key.pem \
-            "$EC2_USER@${{ steps.server.outputs.public_ip }}" <<EOF
+            "$EC2_USER@${{ steps.server.outputs.public_ip }}" <<'EOF'
 
               set -e
+
+              TOMCAT_VERSION="10.1.57"
+              TOMCAT_FILE="/tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz"
 
               sudo cloud-init status --wait || true
 
@@ -372,43 +376,37 @@ jobs:
                 tar
 
               if [ ! -f /opt/tomcat/bin/startup.sh ]; then
-
                 echo "Installing Tomcat..."
 
                 sudo rm -rf /opt/tomcat
-                sudo rm -rf /opt/apache-tomcat-${TOMCAT_VERSION}
+                sudo rm -f "$TOMCAT_FILE"
 
-                # Remove old protected archive
-                sudo rm -f \
-                  /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz
+                sudo mkdir -p /opt/tomcat
 
-                # Download with root permission
-                sudo wget \
-                  -O /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz \
-                  https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
+                sudo wget -q \
+                  -O "$TOMCAT_FILE" \
+                  "https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz"
 
                 sudo tar \
-                  -xzf /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz \
-                  -C /opt
-
-                sudo mv \
-                  /opt/apache-tomcat-${TOMCAT_VERSION} \
-                  /opt/tomcat
-
+                  -xzf "$TOMCAT_FILE" \
+                  -C /opt/tomcat \
+                  --strip-components=1
               fi
 
               if [ ! -f /opt/tomcat/bin/startup.sh ]; then
                 echo "Tomcat installation failed"
+                sudo find /opt/tomcat -maxdepth 3 -type f | head -50
                 exit 1
               fi
 
               sudo chmod +x /opt/tomcat/bin/*.sh
 
-              echo "Java and Tomcat are ready"
+              echo "Tomcat installed successfully"
+              ls -l /opt/tomcat/bin/startup.sh
 
           EOF
 
-      # 14. Copy WAR to EC2
+      # 14. Copy WAR file
       - name: Copy WAR to EC2
         shell: bash
         run: |
@@ -427,41 +425,42 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             -i key.pem \
-            "$EC2_USER@${{ steps.server.outputs.public_ip }}" <<EOF
+            "$EC2_USER@${{ steps.server.outputs.public_ip }}" <<'EOF'
 
               set -e
+
+              APP_NAME="devopsproject"
 
               sudo /opt/tomcat/bin/shutdown.sh || true
 
               sleep 5
 
               sudo rm -rf \
-                /opt/tomcat/webapps/${APP_NAME}
+                "/opt/tomcat/webapps/${APP_NAME}"
 
               sudo rm -f \
-                /opt/tomcat/webapps/${APP_NAME}.war
+                "/opt/tomcat/webapps/${APP_NAME}.war"
 
               sudo cp \
-                /tmp/${APP_NAME}.war \
-                /opt/tomcat/webapps/${APP_NAME}.war
+                "/tmp/${APP_NAME}.war" \
+                "/opt/tomcat/webapps/${APP_NAME}.war"
 
               sudo chmod 644 \
-                /opt/tomcat/webapps/${APP_NAME}.war
+                "/opt/tomcat/webapps/${APP_NAME}.war"
 
               sudo /opt/tomcat/bin/startup.sh
 
           EOF
 
-      # 16. Verify application URL
+      # 16. Verify application
       - name: Verify application
         shell: bash
         run: |
-          URL="http://${{ steps.server.outputs.public_ip }}:8080/${APP_NAME}/"
+          URL="http://${{ steps.server.outputs.public_ip }}:8080/$APP_NAME/"
 
           echo "Checking URL: $URL"
 
           for attempt in {1..20}; do
-
             STATUS=$(curl \
               --silent \
               --output /dev/null \
@@ -477,13 +476,12 @@ jobs:
             fi
 
             sleep 10
-
           done
 
           echo "Application verification failed"
           exit 1
 
-      # 17. Delete temporary key
+      # 17. Remove temporary PEM key
       - name: Delete temporary SSH key
         if: always()
         run: rm -f key.pem

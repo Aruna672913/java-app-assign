@@ -8,7 +8,7 @@ on:
 
 env:
   EC2_NAME: Webserver
-  WAR_FILE: target/java-app.war
+  WAR_FILE: target/devopsproject.war
   APP_NAME: java-app
   TOMCAT_HOME: /opt/tomcat
 

@@ -9,30 +9,22 @@ on:
 env:
   EC2_NAME: Webserver
   EC2_USER: ec2-user
-
   WAR_FILE: target/devopsproject.war
   APP_NAME: devopsproject
-
   TOMCAT_VERSION: 10.1.57
-  TOMCAT_HOME: /opt/tomcat
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-
-      # ---------------------------------------------------
-      # 1. Download code from GitHub
-      # ---------------------------------------------------
+      # 1. Download source code
       - name: Checkout code
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      # ---------------------------------------------------
-      # 2. Install Java on GitHub Actions runner
-      # ---------------------------------------------------
+      # 2. Install Java on GitHub runner
       - name: Setup Java 17
         uses: actions/setup-java@v5
         with:
@@ -40,19 +32,14 @@ jobs:
           java-version: "17"
           cache: maven
 
-      # ---------------------------------------------------
-      # 3. Build Java application and generate WAR
-      # ---------------------------------------------------
+      # 3. Build the WAR file
       - name: Build WAR
         run: mvn clean package
 
-      # ---------------------------------------------------
-      # 4. Confirm WAR file exists
-      # ---------------------------------------------------
+      # 4. Verify the WAR exists
       - name: Verify WAR
         shell: bash
         run: |
-          echo "Files inside target folder:"
           ls -la target
 
           if [ ! -f "$WAR_FILE" ]; then
@@ -60,11 +47,9 @@ jobs:
             exit 1
           fi
 
-          echo "WAR file created successfully: $WAR_FILE"
+          echo "WAR file created: $WAR_FILE"
 
-      # ---------------------------------------------------
       # 5. Run SonarCloud scan
-      # ---------------------------------------------------
       - name: SonarCloud scan
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -75,9 +60,7 @@ jobs:
             -Dsonar.projectKey=Aruna672913_java-app-assign \
             -Dsonar.host.url=https://sonarcloud.io
 
-      # ---------------------------------------------------
       # 6. Connect GitHub Actions to AWS
-      # ---------------------------------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -85,15 +68,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # ---------------------------------------------------
-      # 7. Test AWS login
-      # ---------------------------------------------------
+      # 7. Verify AWS authentication
       - name: Test AWS connection
         run: aws sts get-caller-identity
 
-      # ---------------------------------------------------
-      # 8. Check whether EC2 already exists
-      # ---------------------------------------------------
+      # 8. Check whether EC2 exists
       - name: Check EC2
         id: check_ec2
         shell: bash
@@ -107,17 +86,14 @@ jobs:
 
           if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "EC2 does not exist."
-            echo "A new EC2 instance will be created."
+            echo "EC2 does not exist. A new instance will be created."
           else
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
             echo "Existing EC2 found: $INSTANCE_ID"
           fi
 
-      # ---------------------------------------------------
-      # 9. Create EC2 only when it does not exist
-      # ---------------------------------------------------
+      # 9. Create EC2 only when missing
       - name: Create EC2
         id: create_ec2
         if: steps.check_ec2.outputs.exists == 'false'
@@ -133,7 +109,7 @@ jobs:
             --output text)
 
           if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
-            echo "Default VPC was not found."
+            echo "Default VPC not found"
             exit 1
           fi
 
@@ -149,13 +125,13 @@ jobs:
             --output text)
 
           if [ "$SUBNET_ID" = "None" ] || [ -z "$SUBNET_ID" ]; then
-            echo "Default subnet was not found."
+            echo "Default subnet not found"
             exit 1
           fi
 
           echo "Default subnet: $SUBNET_ID"
 
-          echo "Checking security group..."
+          echo "Finding security group..."
 
           SG_ID=$(aws ec2 describe-security-groups \
             --filters \
@@ -177,23 +153,21 @@ jobs:
 
           echo "Security group: $SG_ID"
 
-          echo "Opening SSH port 22..."
-
+          # Open SSH port
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
             --protocol tcp \
             --port 22 \
             --cidr 0.0.0.0/0 || true
 
-          echo "Opening Tomcat port 8080..."
-
+          # Open Tomcat port
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
             --protocol tcp \
             --port 8080 \
             --cidr 0.0.0.0/0 || true
 
-          echo "Finding latest Amazon Linux 2023 AMI..."
+          echo "Finding Amazon Linux AMI..."
 
           AMI_ID=$(aws ec2 describe-images \
             --owners amazon \
@@ -205,28 +179,26 @@ jobs:
             --output text)
 
           if [ "$AMI_ID" = "None" ] || [ -z "$AMI_ID" ]; then
-            echo "Amazon Linux 2023 AMI was not found."
+            echo "Amazon Linux AMI not found"
             exit 1
           fi
 
           echo "AMI ID: $AMI_ID"
 
+          # Install Java and Tomcat during EC2 startup
           cat > user-data.sh <<EOF
           #!/bin/bash
           set -e
 
           dnf update -y
-
-          dnf install -y \
-            java-17-amazon-corretto-devel \
-            wget \
-            tar
+          dnf install -y java-17-amazon-corretto-devel wget tar
 
           rm -rf /opt/tomcat
           rm -rf /opt/apache-tomcat-${TOMCAT_VERSION}
+          rm -f /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz
 
           wget \
-            --output-document=/tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz \
+            -O /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz \
             https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
 
           tar \
@@ -258,12 +230,11 @@ jobs:
             --output text)
 
           if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
-            echo "EC2 creation failed."
+            echo "EC2 creation failed"
             exit 1
           fi
 
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
-
           echo "New EC2 created: $INSTANCE_ID"
 
           aws ec2 wait instance-running \
@@ -272,9 +243,7 @@ jobs:
           aws ec2 wait instance-status-ok \
             --instance-ids "$INSTANCE_ID"
 
-      # ---------------------------------------------------
-      # 10. Use existing EC2 or newly created EC2
-      # ---------------------------------------------------
+      # 10. Select existing or newly created EC2
       - name: Get EC2 details
         id: server
         shell: bash
@@ -284,7 +253,7 @@ jobs:
             echo "Using existing EC2: $INSTANCE_ID"
           else
             INSTANCE_ID="${{ steps.create_ec2.outputs.instance_id }}"
-            echo "Using newly created EC2: $INSTANCE_ID"
+            echo "Using new EC2: $INSTANCE_ID"
           fi
 
           STATE=$(aws ec2 describe-instances \
@@ -302,8 +271,6 @@ jobs:
           fi
 
           if [ "$STATE" = "stopped" ]; then
-            echo "Starting stopped EC2..."
-
             aws ec2 start-instances \
               --instance-ids "$INSTANCE_ID"
 
@@ -328,7 +295,7 @@ jobs:
             --output text)
 
           if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
-            echo "EC2 does not have a public IP."
+            echo "EC2 does not have a public IP"
             exit 1
           fi
 
@@ -338,24 +305,19 @@ jobs:
           echo "Instance ID: $INSTANCE_ID"
           echo "Public IP: $PUBLIC_IP"
 
-      # ---------------------------------------------------
-      # 11. Create temporary PEM file
-      # ---------------------------------------------------
+      # 11. Create temporary SSH key
       - name: Prepare SSH key
         shell: bash
         run: |
           printf '%s\n' "${{ secrets.EC2_PRIVATE_KEY }}" > key.pem
-
           chmod 600 key.pem
 
           if [ ! -s key.pem ]; then
-            echo "EC2_PRIVATE_KEY is empty."
+            echo "EC2_PRIVATE_KEY is empty"
             exit 1
           fi
 
-      # ---------------------------------------------------
-      # 12. Wait until SSH is ready
-      # ---------------------------------------------------
+      # 12. Wait until EC2 SSH is available
       - name: Wait for SSH
         shell: bash
         run: |
@@ -370,7 +332,7 @@ jobs:
               "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
               "echo SSH connected"; then
 
-              echo "SSH connection successful."
+              echo "SSH is ready"
               exit 0
             fi
 
@@ -378,12 +340,10 @@ jobs:
             sleep 20
           done
 
-          echo "SSH connection failed."
+          echo "SSH connection failed"
           exit 1
 
-      # ---------------------------------------------------
-      # 13. Install Java and Tomcat if missing
-      # ---------------------------------------------------
+      # 13. Install or repair Java and Tomcat
       - name: Install Java and Tomcat
         shell: bash
         run: |
@@ -408,8 +368,12 @@ jobs:
                 sudo rm -rf /opt/tomcat
                 sudo rm -rf /opt/apache-tomcat-${TOMCAT_VERSION}
 
-                wget \
-                  --output-document=/tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz \
+                # Fixes the previous permission-denied issue
+                sudo rm -f \
+                  /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz
+
+                sudo wget \
+                  -O /tmp/apache-tomcat-${TOMCAT_VERSION}.tar.gz \
                   https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
 
                 sudo tar \
@@ -421,15 +385,18 @@ jobs:
                   /opt/tomcat
               fi
 
+              if [ ! -f /opt/tomcat/bin/startup.sh ]; then
+                echo "Tomcat installation failed"
+                exit 1
+              fi
+
               sudo chmod +x /opt/tomcat/bin/*.sh
 
-              echo "Java and Tomcat are ready."
+              echo "Java and Tomcat are ready"
 
           EOF
 
-      # ---------------------------------------------------
-      # 14. Copy WAR file to EC2
-      # ---------------------------------------------------
+      # 14. Copy WAR to EC2
       - name: Copy WAR to EC2
         shell: bash
         run: |
@@ -440,9 +407,7 @@ jobs:
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}:/tmp/$APP_NAME.war"
 
-      # ---------------------------------------------------
-      # 15. Deploy WAR file to Tomcat
-      # ---------------------------------------------------
+      # 15. Deploy WAR into Tomcat
       - name: Deploy application
         shell: bash
         run: |
@@ -475,9 +440,7 @@ jobs:
 
           EOF
 
-      # ---------------------------------------------------
-      # 16. Verify public application URL
-      # ---------------------------------------------------
+      # 16. Verify application
       - name: Verify application
         shell: bash
         run: |
@@ -496,7 +459,7 @@ jobs:
             echo "Attempt $attempt: HTTP $STATUS"
 
             if [ "$STATUS" = "200" ]; then
-              echo "Application deployed successfully."
+              echo "Application deployed successfully"
               echo "Application URL: $URL"
               exit 0
             fi
@@ -504,12 +467,10 @@ jobs:
             sleep 10
           done
 
-          echo "Application verification failed."
+          echo "Application verification failed"
           exit 1
 
-      # ---------------------------------------------------
-      # 17. Delete temporary private key
-      # ---------------------------------------------------
+      # 17. Delete temporary SSH key
       - name: Delete temporary SSH key
         if: always()
         run: rm -f key.pem

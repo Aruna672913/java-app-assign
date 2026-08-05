@@ -1,20 +1,11 @@
-env:
-  EC2_NAME: Webserver
-  EC2_USER: ec2-user
-  APP_NAME: devopsproject
-  WAR_FILE: target/devopsproject.war
-  SG_NAME: java-app-sg
-  TOMCAT_VERSION: 10.1.57
-
-jobs:
-  deploy:
+  infra:
+    name: Provision Infrastructure
     runs-on: ubuntu-latest
+    needs:build
 
     steps:
-      # Your checkout, Java setup, Maven build and Sonar steps come above
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+       - name: Configure AWS Credentials
+         uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}

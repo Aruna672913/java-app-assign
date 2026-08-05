@@ -206,10 +206,10 @@ jobs:
             sleep 20
           done
 
-          exit 1
+                   exit 1
 
-            - name: Install Java And Tomcat
-              run: |
+      - name: Install Java And Tomcat
+        run: |
           ssh \
             -o StrictHostKeyChecking=no \
             -i "$HOME/.ssh/key.pem" \

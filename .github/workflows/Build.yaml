@@ -1,0 +1,56 @@
+name: Java CI/CD to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  EC2_NAME: Webserver
+  EC2_USER: ec2-user
+  WAR_FILE: target/devopsproject.war
+  APP_NAME: devopsproject
+  TOMCAT_VERSION: 10.1.57
+  TOMCAT_PORT: "8080"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Build WAR
+        run: mvn clean package
+
+      - name: Verify WAR
+        run: |
+          ls -la target
+
+          if [ ! -f "$WAR_FILE" ]; then
+            echo "WAR file not found: $WAR_FILE"
+            exit 1
+          fi
+
+          echo "WAR file created successfully"
+
+      - name: SonarCloud Scan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.organization=aruna672913 \
+            -Dsonar.projectKey=Aruna672913_java-app-assign \
+            -Dsonar.host.url=https://sonarcloud.io

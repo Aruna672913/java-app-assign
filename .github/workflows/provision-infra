@@ -259,3 +259,5 @@ jobs:
             -i ~/.ssh/key.pem \
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.ec2.outputs.public_ip }}:/tmp/$APP_NAME.war"
+
+

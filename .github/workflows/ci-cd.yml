@@ -267,7 +267,7 @@ jobs:
 
             - name: Verify Application
               run: |
-                URL="https://your-domain.com/${APP_NAME}/"
+                URL="http://${{ steps.server.outputs.public_ip }}:8080/${APP_NAME}/"
 
                         for i in {1..30}; do
                       STATUS=$(curl \

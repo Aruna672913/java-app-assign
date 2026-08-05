@@ -276,50 +276,55 @@ jobs:
 
           REMOTE
 
-      - name: Verify Tomcat Deployment
-        run: |
-          IP="${{ steps.server.outputs.public_ip }}"
-          URL="http://${IP}:${TOMCAT_PORT}/${APP_NAME}/"
+            - name: Verify Tomcat Deployment
+              run: |
+          ssh \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/key.pem" \
+            "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
+            "sudo bash -s -- '$APP_NAME' '$TOMCAT_PORT'" <<'REMOTE'
 
-          echo "Checking public URL: $URL"
+          set -e
 
-          for attempt in {1..18}; do
-            if curl \
-              --fail \
-              --silent \
-              --show-error \
-              --connect-timeout 10 \
-              "$URL" >/dev/null; then
+          APP_NAME="$1"
+          TOMCAT_PORT="$2"
 
-              echo "Application deployed successfully"
-              echo "Application URL: $URL"
+          echo "Checking deployed WAR file"
+          test -f "/opt/tomcat/webapps/$APP_NAME.war"
 
-              echo "## Deployment Successful" \
-                >> "$GITHUB_STEP_SUMMARY"
+          echo "Checking Tomcat port"
+          ss -ltn | grep -Eq ":${TOMCAT_PORT}[[:space:]]"
 
-              echo "Application URL: [$URL]($URL)" \
-                >> "$GITHUB_STEP_SUMMARY"
+          echo "Waiting for Tomcat to extract the application"
 
-              exit 0
+          for attempt in {1..12}; do
+            if [ -d "/opt/tomcat/webapps/$APP_NAME" ]; then
+              echo "Application directory created successfully"
+              break
             fi
 
-            echo "Waiting for public application: $attempt/18"
-            sleep 10
+            if [ "$attempt" = "12" ]; then
+              echo "Application was not extracted"
+              tail -n 100 /opt/tomcat/logs/catalina.out || true
+              exit 1
+            fi
+
+            sleep 5
           done
 
-          echo "Public URL verification failed"
+          echo "Tomcat deployment verification passed"
 
-          echo "Checking application inside EC2"
+          REMOTE
 
-          ssh \
-            -o StrictHostKeyChecking=no \
-            -i "$HOME/.ssh/key.pem" \
-            "$EC2_USER@$IP" \
-            "sudo ss -ltnp | grep ':${TOMCAT_PORT}' || true;
-             sudo curl -I http://127.0.0.1:${TOMCAT_PORT}/${APP_NAME}/ || true;
-             sudo tail -n 100 /opt/tomcat/logs/catalina.out || true"
+          echo "Application deployed successfully"
+          echo "Public IP: ${{ steps.server.outputs.public_ip }}"
+          echo "Port: $TOMCAT_PORT"
+          echo "Path: /$APP_NAME/"
 
-          exit 1
+          echo "## Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "Public IP: ${{ steps.server.outputs.public_ip }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Port: $TOMCAT_PORT" >> "$GITHUB_STEP_SUMMARY"
+          echo "Application path: /$APP_NAME/" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup
         if: always()

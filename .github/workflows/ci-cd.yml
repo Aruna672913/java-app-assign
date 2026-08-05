@@ -32,7 +32,7 @@ jobs:
       - name: Build WAR
         run: mvn clean package
 
-      - name: Check WAR
+      - name: Verify WAR
         run: test -f "$WAR_FILE"
 
       - name: SonarCloud scan
@@ -60,6 +60,8 @@ jobs:
           SUBNET_ID: ${{ secrets.SUBNET_ID }}
           SECURITY_GROUP_ID: ${{ secrets.SECURITY_GROUP_ID }}
         run: |
+          set -euo pipefail
+
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters \
               "Name=tag:Name,Values=$EC2_NAME" \
@@ -68,6 +70,8 @@ jobs:
             --output text)
 
           if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+            echo "EC2 not found. Creating a new EC2."
+
             INSTANCE_ID=$(aws ec2 run-instances \
               --image-id "$AMI_ID" \
               --instance-type t3.micro \
@@ -80,6 +84,8 @@ jobs:
               --query "Instances[0].InstanceId" \
               --output text)
           else
+            echo "Existing EC2 found: $INSTANCE_ID"
+
             STATE=$(aws ec2 describe-instances \
               --instance-ids "$INSTANCE_ID" \
               --query "Reservations[0].Instances[0].State.Name" \
@@ -102,33 +108,114 @@ jobs:
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)
 
+          if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
+            echo "EC2 public IP not found"
+            exit 1
+          fi
+
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
           echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare SSH
+          echo "Instance ID: $INSTANCE_ID"
+          echo "Public IP: $PUBLIC_IP"
+
+      - name: Allow GitHub runner SSH
+        run: |
+          set -euo pipefail
+
+          INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
+
+          SG_ID=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].SecurityGroups[0].GroupId" \
+            --output text)
+
+          RUNNER_IP=$(wget \
+            --quiet \
+            --max-redirect=0 \
+            --output-document=- \
+            https://checkip.amazonaws.com |
+            tr -d '[:space:]')
+
+          if [ -z "$RUNNER_IP" ]; then
+            echo "GitHub runner IP could not be identified"
+            exit 1
+          fi
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "${RUNNER_IP}/32" || true
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_ID" \
+            --protocol tcp \
+            --port 8080 \
+            --cidr 0.0.0.0/0 || true
+
+          echo "SSH allowed for GitHub runner: $RUNNER_IP"
+
+      - name: Prepare SSH key
         env:
           EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
         run: |
+          set -euo pipefail
+
+          if [ -z "$EC2_PRIVATE_KEY" ]; then
+            echo "EC2_PRIVATE_KEY is empty"
+            exit 1
+          fi
+
           printf '%s\n' "$EC2_PRIVATE_KEY" > key.pem
           chmod 600 key.pem
 
+      - name: Wait for SSH
+        run: |
+          set -euo pipefail
+
           mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
 
           for attempt in {1..20}; do
-            ssh-keyscan -T 10 \
+            echo "SSH check $attempt"
+
+            if ssh-keyscan \
+              -T 5 \
               -H "${{ steps.ec2.outputs.public_ip }}" \
-              > "$HOME/.ssh/known_hosts" 2>/dev/null && break
+              > "$HOME/.ssh/known_hosts" 2>/dev/null; then
+
+              chmod 600 "$HOME/.ssh/known_hosts"
+
+              if ssh \
+                -o StrictHostKeyChecking=yes \
+                -o ConnectTimeout=10 \
+                -i key.pem \
+                "$EC2_USER@${{ steps.ec2.outputs.public_ip }}" \
+                "echo SSH connected"; then
+                exit 0
+              fi
+            fi
 
             sleep 15
           done
 
+          echo "SSH connection failed"
+          exit 1
+
       - name: Install Java and Tomcat
         run: |
-          ssh -o StrictHostKeyChecking=yes \
+          ssh \
+            -o StrictHostKeyChecking=yes \
             -i key.pem \
             "$EC2_USER@${{ steps.ec2.outputs.public_ip }}" \
-            "sudo bash -s" <<'EOF'
+            "sudo bash -s" <<'REMOTE'
 
-          set -e
+          set -euo pipefail
+
+          VERSION="10.1.57"
+          FILE="/tmp/tomcat.tar.gz"
+          URL="https://archive.apache.org/dist/tomcat/tomcat-10/v${VERSION}/bin/apache-tomcat-${VERSION}.tar.gz"
 
           dnf install -y \
             java-17-amazon-corretto-devel \
@@ -137,38 +224,45 @@ jobs:
 
           if [ ! -f /opt/tomcat/bin/startup.sh ]; then
             rm -rf /opt/tomcat
-            rm -f /tmp/tomcat.tar.gz
+            rm -f "$FILE"
 
-            wget --quiet \
+            wget \
+              --quiet \
               --max-redirect=0 \
-              --output-document=/tmp/tomcat.tar.gz \
-              https://archive.apache.org/dist/tomcat/tomcat-10/v10.1.57/bin/apache-tomcat-10.1.57.tar.gz
+              --output-document="$FILE" \
+              "$URL"
 
             mkdir -p /opt/tomcat
 
-            tar -xzf /tmp/tomcat.tar.gz \
+            tar -xzf "$FILE" \
               -C /opt/tomcat \
               --strip-components=1
-
-            chmod +x /opt/tomcat/bin/*.sh
           fi
-          EOF
+
+          test -f /opt/tomcat/bin/startup.sh
+          chmod +x /opt/tomcat/bin/*.sh
+
+          echo "Java and Tomcat are ready"
+
+          REMOTE
 
       - name: Copy WAR
         run: |
-          scp -o StrictHostKeyChecking=yes \
+          scp \
+            -o StrictHostKeyChecking=yes \
             -i key.pem \
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.ec2.outputs.public_ip }}:/tmp/$APP_NAME.war"
 
       - name: Deploy application
         run: |
-          ssh -o StrictHostKeyChecking=yes \
+          ssh \
+            -o StrictHostKeyChecking=yes \
             -i key.pem \
             "$EC2_USER@${{ steps.ec2.outputs.public_ip }}" \
-            "sudo bash -s" <<'EOF'
+            "sudo bash -s" <<'REMOTE'
 
-          set -e
+          set -euo pipefail
 
           APP_NAME="devopsproject"
 
@@ -181,16 +275,41 @@ jobs:
           cp "/tmp/$APP_NAME.war" \
             "/opt/tomcat/webapps/$APP_NAME.war"
 
+          chmod 644 \
+            "/opt/tomcat/webapps/$APP_NAME.war"
+
           /opt/tomcat/bin/startup.sh
-          EOF
+
+          REMOTE
 
       - name: Verify deployment
         run: |
-          ssh -o StrictHostKeyChecking=yes \
+          ssh \
+            -o StrictHostKeyChecking=yes \
             -i key.pem \
             "$EC2_USER@${{ steps.ec2.outputs.public_ip }}" \
-            "sudo test -f /opt/tomcat/webapps/$APP_NAME.war &&
-             sudo ss -ltn | grep -q ':8080 '"
+            "sudo bash -s" <<'REMOTE'
+
+          set -euo pipefail
+
+          APP_NAME="devopsproject"
+
+          for attempt in {1..20}; do
+            if pgrep -f "org.apache.catalina.startup.Bootstrap" >/dev/null \
+              && ss -ltn | grep -q ":8080 " \
+              && [ -f "/opt/tomcat/webapps/$APP_NAME.war" ]; then
+
+              echo "Deployment verified successfully"
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          tail -100 /opt/tomcat/logs/catalina.out || true
+          exit 1
+
+          REMOTE
 
           echo "Public IP: ${{ steps.ec2.outputs.public_ip }}"
           echo "Port: 8080"

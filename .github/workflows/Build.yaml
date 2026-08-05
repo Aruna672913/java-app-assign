@@ -1,60 +1,456 @@
-name: Java CI/CD 
+name: Java CI/CD
 
 on:
   push:
     branches:
       - main
   workflow_dispatch:
+
 permissions:
   contents: read
+
 env:
   EC2_NAME: Webserver
   EC2_USER: ec2-user
-  WAR_FILE: target/devopsproject.war
-  APP_NAME: devopsproject
   SG_NAME: java-app-sg
-  TOMCAT_VERSION: 10.1.57
-  TOMCAT_PORT: "8080"
-  
-   # ==========================================
-  # BUILD APPLICATION
-  # ==========================================
-  
+  APP_NAME: devopsproject
+  WAR_FILE: target/devopsproject.war
+  TOMCAT_VERSION: "10.1.57"
+
 jobs:
+
+  # ==================================================
+  # JOB 1: BUILD APPLICATION
+  # ==================================================
   build:
+    name: Build Application
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
       - name: Setup Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
           cache: maven
 
-      - name: Build WAR
-        run: mvn clean package
-
-      - name: Verify WAR
+      - name: Build And SonarCloud Scan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
+          SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
         run: |
-          ls -la target
+          mvn -B clean verify \
+            org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.token="$SONAR_TOKEN" \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+            -Dsonar.organization="$SONAR_ORGANIZATION" \
+            -Dsonar.qualitygate.wait=true
 
+      - name: Verify WAR File
+        run: |
           if [ ! -f "$WAR_FILE" ]; then
             echo "WAR file not found: $WAR_FILE"
             exit 1
           fi
 
-          echo "WAR file created successfully"
+          echo "WAR created successfully"
+          ls -lh "$WAR_FILE"
 
-      - name: SonarCloud Scan
+      - name: Upload WAR Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: java-war
+          path: ${{ env.WAR_FILE }}
+          if-no-files-found: error
+          retention-days: 5
+
+
+  # ==================================================
+  # JOB 2: CHECK OR CREATE INFRASTRUCTURE
+  # ==================================================
+  infra:
+    name: Provision Infrastructure
+    runs-on: ubuntu-latest
+
+    # Infra runs only after build succeeds
+    needs: build
+
+    outputs:
+      instance_id: ${{ steps.ec2.outputs.instance_id }}
+      public_ip: ${{ steps.ec2.outputs.public_ip }}
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify AWS Access
+        run: aws sts get-caller-identity
+
+      - name: Check Or Create EC2
+        id: ec2
         env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          AWS_KEY_NAME: ${{ secrets.AWS_KEY_NAME }}
         run: |
-          mvn org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
-            -Dsonar.token="$SONAR_TOKEN" \
-            -Dsonar.organization=aruna672913 \
-            -Dsonar.projectKey=Aruna672913_java-app-assign \
-            -Dsonar.host.url=https://sonarcloud.io
+          set -e
+
+          echo "Checking whether EC2 already exists..."
+
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=$EC2_NAME" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[].Instances[].InstanceId | [0]" \
+            --output text)
+
+          # Create infrastructure only if EC2 is missing
+          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+
+            echo "EC2 not found. Creating infrastructure..."
+
+            # Get default VPC
+            VPC_ID=$(aws ec2 describe-vpcs \
+              --filters "Name=is-default,Values=true" \
+              --query "Vpcs[0].VpcId" \
+              --output text)
+
+            if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+              echo "Default VPC not found"
+              exit 1
+            fi
+
+            echo "Default VPC: $VPC_ID"
+
+            # Get one default subnet
+            SUBNET_ID=$(aws ec2 describe-subnets \
+              --filters \
+                "Name=vpc-id,Values=$VPC_ID" \
+                "Name=default-for-az,Values=true" \
+              --query "Subnets[0].SubnetId" \
+              --output text)
+
+            if [ "$SUBNET_ID" = "None" ] || [ -z "$SUBNET_ID" ]; then
+              echo "Default subnet not found"
+              exit 1
+            fi
+
+            echo "Default subnet: $SUBNET_ID"
+
+            # Check whether security group exists
+            SG_ID=$(aws ec2 describe-security-groups \
+              --filters \
+                "Name=group-name,Values=$SG_NAME" \
+                "Name=vpc-id,Values=$VPC_ID" \
+              --query "SecurityGroups[0].GroupId" \
+              --output text)
+
+            # Create security group only if missing
+            if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+
+              SG_ID=$(aws ec2 create-security-group \
+                --group-name "$SG_NAME" \
+                --description "Java Tomcat application security group" \
+                --vpc-id "$VPC_ID" \
+                --query "GroupId" \
+                --output text)
+
+              echo "Security group created: $SG_ID"
+            else
+              echo "Using existing security group: $SG_ID"
+            fi
+
+            # Check and create ports without duplicate-rule errors
+            for PORT in 22 8080; do
+
+              RULE_COUNT=$(aws ec2 describe-security-group-rules \
+                --filters "Name=group-id,Values=$SG_ID" \
+                --query "length(SecurityGroupRules[?IsEgress==\`false\` && IpProtocol=='tcp' && FromPort==\`$PORT\` && ToPort==\`$PORT\` && CidrIpv4=='0.0.0.0/0'])" \
+                --output text)
+
+              if [ "$RULE_COUNT" = "0" ]; then
+                aws ec2 authorize-security-group-ingress \
+                  --group-id "$SG_ID" \
+                  --protocol tcp \
+                  --port "$PORT" \
+                  --cidr 0.0.0.0/0
+
+                echo "Port $PORT added to security group"
+              else
+                echo "Port $PORT already exists"
+              fi
+            done
+
+            # Get latest Amazon Linux 2023 AMI
+            AMI_ID=$(aws ec2 describe-images \
+              --owners amazon \
+              --filters \
+                "Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64" \
+                "Name=architecture,Values=x86_64" \
+                "Name=state,Values=available" \
+              --query "sort_by(Images,&CreationDate)[-1].ImageId" \
+              --output text)
+
+            if [ "$AMI_ID" = "None" ] || [ -z "$AMI_ID" ]; then
+              echo "Amazon Linux 2023 AMI not found"
+              exit 1
+            fi
+
+            echo "AMI ID: $AMI_ID"
+
+            # Create EC2
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id "$AMI_ID" \
+              --instance-type t3.micro \
+              --key-name "$AWS_KEY_NAME" \
+              --subnet-id "$SUBNET_ID" \
+              --security-group-ids "$SG_ID" \
+              --associate-public-ip-address \
+              --tag-specifications \
+                "ResourceType=instance,Tags=[{Key=Name,Value=$EC2_NAME}]" \
+              --query "Instances[0].InstanceId" \
+              --output text)
+
+            echo "New EC2 created: $INSTANCE_ID"
+
+          else
+            echo "Existing EC2 found: $INSTANCE_ID"
+          fi
+
+          # Check EC2 state
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)
+
+          echo "Current EC2 state: $STATE"
+
+          # Wait if EC2 is stopping
+          if [ "$STATE" = "stopping" ]; then
+            echo "Waiting for EC2 to stop..."
+
+            aws ec2 wait instance-stopped \
+              --instance-ids "$INSTANCE_ID"
+
+            STATE="stopped"
+          fi
+
+          # Start EC2 if stopped
+          if [ "$STATE" = "stopped" ]; then
+            echo "Starting EC2..."
+
+            aws ec2 start-instances \
+              --instance-ids "$INSTANCE_ID"
+          fi
+
+          # Wait for EC2 to become ready
+          aws ec2 wait instance-running \
+            --instance-ids "$INSTANCE_ID"
+
+          aws ec2 wait instance-status-ok \
+            --instance-ids "$INSTANCE_ID"
+
+          # Get public IP
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
+
+          if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
+            echo "EC2 public IP not found"
+            exit 1
+          fi
+
+          # Pass values to deploy job
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+
+          echo "Infrastructure is ready"
+          echo "Instance ID: $INSTANCE_ID"
+          echo "Public IP: $PUBLIC_IP"
+
+
+  # ==================================================
+  # JOB 3: DEPLOY APPLICATION
+  # ==================================================
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+
+    # Deploy runs only after build and infra succeed
+    needs:
+      - build
+      - infra
+
+    env:
+      PUBLIC_IP: ${{ needs.infra.outputs.public_ip }}
+
+    steps:
+      - name: Download WAR Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: java-war
+          path: target
+
+      - name: Verify Downloaded WAR
+        run: |
+          if [ ! -f "$WAR_FILE" ]; then
+            echo "WAR file not found: $WAR_FILE"
+            exit 1
+          fi
+
+          echo "WAR downloaded successfully"
+          ls -lh "$WAR_FILE"
+
+      - name: Prepare SSH Private Key
+        env:
+          EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+        run: |
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$EC2_PRIVATE_KEY" > "$HOME/.ssh/key.pem"
+          chmod 600 "$HOME/.ssh/key.pem"
+
+      - name: Wait For SSH
+        run: |
+          for i in {1..30}; do
+
+            if ssh \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              -i "$HOME/.ssh/key.pem" \
+              "$EC2_USER@$PUBLIC_IP" \
+              "echo SSH Ready"; then
+
+              echo "SSH connection successful"
+              exit 0
+            fi
+
+            echo "Waiting for SSH..."
+            sleep 20
+          done
+
+          echo "SSH connection failed"
+          exit 1
+
+      - name: Install Java And Tomcat
+        run: |
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/key.pem" \
+            "$EC2_USER@$PUBLIC_IP" "
+              set -e
+
+              sudo dnf install -y \
+                java-17-amazon-corretto-devel \
+                wget \
+                tar
+
+              if [ ! -f /opt/tomcat/bin/startup.sh ]; then
+
+                echo 'Installing Tomcat...'
+
+                sudo rm -rf /opt/tomcat
+                sudo rm -f /tmp/tomcat.tar.gz
+                sudo mkdir -p /opt/tomcat
+
+                sudo wget -q \
+                  -O /tmp/tomcat.tar.gz \
+                  https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
+
+                sudo tar -xzf /tmp/tomcat.tar.gz \
+                  -C /opt/tomcat \
+                  --strip-components=1
+
+                sudo chmod +x /opt/tomcat/bin/*.sh
+                sudo rm -f /tmp/tomcat.tar.gz
+
+                echo 'Tomcat installed successfully'
+              else
+                echo 'Tomcat is already installed'
+              fi
+
+              java -version
+              sudo /opt/tomcat/bin/version.sh
+            "
+
+      - name: Copy WAR To EC2
+        run: |
+          scp \
+            -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/key.pem" \
+            "$WAR_FILE" \
+            "$EC2_USER@$PUBLIC_IP:/tmp/$APP_NAME.war"
+
+      - name: Deploy WAR To Tomcat
+        run: |
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/key.pem" \
+            "$EC2_USER@$PUBLIC_IP" "
+              set -e
+
+              echo 'Stopping Tomcat...'
+
+              sudo /opt/tomcat/bin/shutdown.sh 2>/dev/null || true
+              sleep 5
+
+              echo 'Removing previous application...'
+
+              sudo rm -rf \
+                /opt/tomcat/webapps/$APP_NAME \
+                /opt/tomcat/webapps/$APP_NAME.war
+
+              echo 'Deploying new WAR...'
+
+              sudo cp \
+                /tmp/$APP_NAME.war \
+                /opt/tomcat/webapps/$APP_NAME.war
+
+              echo 'Starting Tomcat...'
+
+              sudo /opt/tomcat/bin/startup.sh
+
+              echo 'WAR deployed successfully'
+            "
+
+      - name: Verify Application
+        run: |
+          APP_URL="http://$PUBLIC_IP:8080/$APP_NAME/"
+
+          for i in {1..20}; do
+
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              "$APP_URL"; then
+
+              echo ""
+              echo "Application is running successfully"
+              echo "Application URL: $APP_URL"
+              exit 0
+            fi
+
+            echo "Waiting for application..."
+            sleep 10
+          done
+
+          echo "Application verification failed"
+          exit 1
+
+      - name: Display Application URL
+        run: |
+          echo "Deployment completed successfully"
+          echo "Application URL:"
+          echo "http://$PUBLIC_IP:8080/$APP_NAME/"
+       - name: Cleanup
+        if: always()
+        run: |
+          rm -f "$HOME/.ssh/key.pem"

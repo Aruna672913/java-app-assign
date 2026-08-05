@@ -207,7 +207,6 @@ jobs:
           done
 
                    exit 1
-
       - name: Install Java And Tomcat
         run: |
           ssh \
@@ -225,23 +224,34 @@ jobs:
                 echo 'Installing Tomcat'
 
                 sudo rm -f /tmp/tomcat.tar.gz
+                sudo rm -rf /opt/tomcat
+                sudo mkdir -p /opt/tomcat
 
                 sudo wget -q \
                   -O /tmp/tomcat.tar.gz \
                   https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
 
-                sudo rm -rf /opt/tomcat
-                sudo mkdir -p /opt/tomcat
+                echo 'Extracting Tomcat'
 
                 sudo tar -xzf /tmp/tomcat.tar.gz \
                   -C /opt/tomcat \
                   --strip-components=1
 
-                sudo chmod +x /opt/tomcat/bin/*.sh
+                echo 'Checking Tomcat files'
+
+                sudo test -f /opt/tomcat/bin/startup.sh
+                sudo test -f /opt/tomcat/bin/shutdown.sh
+
+                sudo bash -c 'chmod +x /opt/tomcat/bin/*.sh'
+
                 sudo rm -f /tmp/tomcat.tar.gz
+
+                echo 'Tomcat installed successfully'
               else
                 echo 'Tomcat is already installed'
               fi
+
+              sudo /opt/tomcat/bin/version.sh
 
               echo 'Java and Tomcat installation completed'
             "

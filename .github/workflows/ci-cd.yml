@@ -240,5 +240,40 @@ jobs:
           scp -i ~/.ssh/key.pem \
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}:/tmp/$APP_NAME.war"
+      
+      - name: Deploy WAR To Tomcat
+        run: |
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i ~/.ssh/key.pem \
+            "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
+            "sudo bash -s -- '$APP_NAME'" <<'REMOTE'
+
+          set -e
+
+          APP_NAME="$1"
+
+          echo "Stopping Tomcat"
+          /opt/tomcat/bin/shutdown.sh || true
+          sleep 5
+
+          echo "Removing old application"
+          rm -rf "/opt/tomcat/webapps/$APP_NAME"
+          rm -f "/opt/tomcat/webapps/$APP_NAME.war"
+
+          echo "Deploying new WAR"
+          cp "/tmp/$APP_NAME.war" \
+            "/opt/tomcat/webapps/$APP_NAME.war"
+
+          echo "Starting Tomcat"
+          /opt/tomcat/bin/startup.sh
+
+          sleep 10
+
+          test -f "/opt/tomcat/webapps/$APP_NAME.war"
+
+          echo "Tomcat deployment completed"
+
+          REMOTE
 
      

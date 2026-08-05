@@ -241,14 +241,13 @@ jobs:
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}:/tmp/$APP_NAME.war"
       
-      - name: Deploy WAR To Tomcat
-        run: |
+           - name: Deploy WAR To Tomcat
+            run: |
           ssh \
-            -o StrictHostKeyChecking=no \
-            -i ~/.ssh/key.pem \
+            -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/key.pem" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
             "sudo bash -s -- '$APP_NAME'" <<'REMOTE'
-
           set -e
 
           APP_NAME="$1"
@@ -267,63 +266,42 @@ jobs:
 
           echo "Starting Tomcat"
           /opt/tomcat/bin/startup.sh
-
           sleep 10
 
-          test -f "/opt/tomcat/webapps/$APP_NAME.war"
-
           echo "Tomcat deployment completed"
-
           REMOTE
 
-            - name: Verify Tomcat Deployment
-              run: |
+      - name: Verify Tomcat Deployment
+        run: |
           ssh \
             -o StrictHostKeyChecking=yes \
             -i "$HOME/.ssh/key.pem" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
-            "sudo bash -s -- '$APP_NAME' '$TOMCAT_PORT'" <<'REMOTE'
-
+            "sudo bash -s -- '$APP_NAME'" <<'REMOTE'
           set -e
 
           APP_NAME="$1"
-          TOMCAT_PORT="$2"
 
-          echo "Checking deployed WAR file"
+          echo "Checking WAR file"
           test -f "/opt/tomcat/webapps/$APP_NAME.war"
 
-          echo "Checking Tomcat port"
-          ss -ltn | grep -Eq ":${TOMCAT_PORT}[[:space:]]"
+          echo "Checking Tomcat process"
+          pgrep -f "org.apache.catalina.startup.Bootstrap" > /dev/null
 
-          echo "Waiting for Tomcat to extract the application"
+          echo "Checking application extraction"
+          test -d "/opt/tomcat/webapps/$APP_NAME"
 
-          for attempt in {1..12}; do
-            if [ -d "/opt/tomcat/webapps/$APP_NAME" ]; then
-              echo "Application directory created successfully"
-              break
-            fi
-
-            if [ "$attempt" = "12" ]; then
-              echo "Application was not extracted"
-              tail -n 100 /opt/tomcat/logs/catalina.out || true
-              exit 1
-            fi
-
-            sleep 5
-          done
-
-          echo "Tomcat deployment verification passed"
-
+          echo "Tomcat verification passed"
           REMOTE
 
           echo "Application deployed successfully"
           echo "Public IP: ${{ steps.server.outputs.public_ip }}"
-          echo "Port: $TOMCAT_PORT"
+          echo "Port: 8080"
           echo "Path: /$APP_NAME/"
 
           echo "## Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
           echo "Public IP: ${{ steps.server.outputs.public_ip }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Port: $TOMCAT_PORT" >> "$GITHUB_STEP_SUMMARY"
+          echo "Port: 8080" >> "$GITHUB_STEP_SUMMARY"
           echo "Application path: /$APP_NAME/" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup

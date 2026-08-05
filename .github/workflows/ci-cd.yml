@@ -241,70 +241,29 @@ jobs:
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}:/tmp/$APP_NAME.war"
       
-           - name: Deploy WAR To Tomcat
+               - name: Deploy WAR To Tomcat
             run: |
-          ssh \
-            -o StrictHostKeyChecking=yes \
+          ssh -o StrictHostKeyChecking=no \
             -i "$HOME/.ssh/key.pem" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
-            "sudo bash -s -- '$APP_NAME'" <<'REMOTE'
-          set -e
-
-          APP_NAME="$1"
-
-          echo "Stopping Tomcat"
-          /opt/tomcat/bin/shutdown.sh || true
-          sleep 5
-
-          echo "Removing old application"
-          rm -rf "/opt/tomcat/webapps/$APP_NAME"
-          rm -f "/opt/tomcat/webapps/$APP_NAME.war"
-
-          echo "Deploying new WAR"
-          cp "/tmp/$APP_NAME.war" \
-            "/opt/tomcat/webapps/$APP_NAME.war"
-
-          echo "Starting Tomcat"
-          /opt/tomcat/bin/startup.sh
-          sleep 10
-
-          echo "Tomcat deployment completed"
-          REMOTE
+            "sudo /opt/tomcat/bin/shutdown.sh || true; \
+             sudo rm -rf /opt/tomcat/webapps/$APP_NAME; \
+             sudo rm -f /opt/tomcat/webapps/$APP_NAME.war; \
+             sudo cp /tmp/$APP_NAME.war /opt/tomcat/webapps/$APP_NAME.war; \
+             sudo /opt/tomcat/bin/startup.sh"
 
       - name: Verify Tomcat Deployment
         run: |
-          ssh \
-            -o StrictHostKeyChecking=yes \
+          ssh -o StrictHostKeyChecking=no \
             -i "$HOME/.ssh/key.pem" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
-            "sudo bash -s -- '$APP_NAME'" <<'REMOTE'
-          set -e
+            "sudo test -f /opt/tomcat/webapps/$APP_NAME.war && \
+             sudo pgrep -f org.apache.catalina.startup.Bootstrap"
 
-          APP_NAME="$1"
-
-          echo "Checking WAR file"
-          test -f "/opt/tomcat/webapps/$APP_NAME.war"
-
-          echo "Checking Tomcat process"
-          pgrep -f "org.apache.catalina.startup.Bootstrap" > /dev/null
-
-          echo "Checking application extraction"
-          test -d "/opt/tomcat/webapps/$APP_NAME"
-
-          echo "Tomcat verification passed"
-          REMOTE
-
-          echo "Application deployed successfully"
+          echo "Tomcat deployment verified"
           echo "Public IP: ${{ steps.server.outputs.public_ip }}"
-          echo "Port: 8080"
-          echo "Path: /$APP_NAME/"
-
-          echo "## Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
-          echo "Public IP: ${{ steps.server.outputs.public_ip }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Port: 8080" >> "$GITHUB_STEP_SUMMARY"
-          echo "Application path: /$APP_NAME/" >> "$GITHUB_STEP_SUMMARY"
+          echo "Application path: /$APP_NAME/"
 
       - name: Cleanup
         if: always()
-        run: |
-          rm -f "$HOME/.ssh/key.pem"
+        run: rm -f "$HOME/.ssh/key.pem"

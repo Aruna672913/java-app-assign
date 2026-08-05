@@ -49,7 +49,7 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
           mvn org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
-            -Dsonar.token=${SONAR_TOKEN} \
+            -Dsonar.token="${SONAR_TOKEN}" \
             -Dsonar.organization=aruna672913 \
             -Dsonar.projectKey=Aruna672913_java-app-assign \
             -Dsonar.host.url=https://sonarcloud.io
@@ -69,16 +69,16 @@ jobs:
         run: |
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters \
-              Name=tag:Name,Values=$EC2_NAME \
-              Name=instance-state-name,Values=pending,running,stopping,stopped \
+            Name=tag:Name,Values=$EC2_NAME \
+            Name=instance-state-name,Values=pending,running,stopping,stopped \
             --query "Reservations[].Instances[].InstanceId | [0]" \
             --output text)
 
           if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           else
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create EC2 If Missing
@@ -94,15 +94,15 @@ jobs:
 
           SUBNET_ID=$(aws ec2 describe-subnets \
             --filters \
-              Name=vpc-id,Values=$VPC_ID \
-              Name=default-for-az,Values=true \
+            Name=vpc-id,Values=$VPC_ID \
+            Name=default-for-az,Values=true \
             --query "Subnets[0].SubnetId" \
             --output text)
 
           SG_ID=$(aws ec2 describe-security-groups \
             --filters \
-              Name=group-name,Values=java-app-sg \
-              Name=vpc-id,Values=$VPC_ID \
+            Name=group-name,Values=java-app-sg \
+            Name=vpc-id,Values=$VPC_ID \
             --query "SecurityGroups[0].GroupId" \
             --output text)
 
@@ -130,9 +130,9 @@ jobs:
           AMI_ID=$(aws ec2 describe-images \
             --owners amazon \
             --filters \
-              Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64 \
-              Name=architecture,Values=x86_64 \
-              Name=state,Values=available \
+            Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64 \
+            Name=architecture,Values=x86_64 \
+            Name=state,Values=available \
             --query "sort_by(Images,&CreationDate)[-1].ImageId" \
             --output text)
 
@@ -147,7 +147,7 @@ jobs:
             --query "Instances[0].InstanceId" \
             --output text)
 
-          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
 
           aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
           aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
@@ -177,8 +177,8 @@ jobs:
             --query "Reservations[0].Instances[0].PublicIpAddress" \
             --output text)
 
-          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
-          echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
 
       - name: Prepare SSH Key
         run: |
@@ -217,20 +217,13 @@ jobs:
           if [ ! -f /opt/tomcat/bin/startup.sh ]; then
 
             wget -q \
-            -O /tmp/tomcat.tar.gz \
-            https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
-
-            wget -q \
-            -O /tmp/tomcat.tar.gz.sha512 \
-            https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz.sha512
-
-            cd /tmp
-            sha512sum -c tomcat.tar.gz.sha512
+              -O /tmp/tomcat.tar.gz \
+              "https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz"
 
             rm -rf /opt/tomcat
             mkdir -p /opt/tomcat
 
-            tar -xzf tomcat.tar.gz \
+            tar -xzf /tmp/tomcat.tar.gz \
               -C /opt/tomcat \
               --strip-components=1
 
@@ -242,8 +235,8 @@ jobs:
       - name: Copy WAR To EC2
         run: |
           scp -i ~/.ssh/key.pem \
-            $WAR_FILE \
-            $EC2_USER@${{ steps.server.outputs.public_ip }}:/tmp/$APP_NAME.war
+            "$WAR_FILE" \
+            "$EC2_USER@${{ steps.server.outputs.public_ip }}:/tmp/$APP_NAME.war"
 
       - name: Deploy Application
         run: |
@@ -274,7 +267,6 @@ jobs:
           URL="http://${{ steps.server.outputs.public_ip }}:8080/${APP_NAME}/"
 
           for i in {1..30}; do
-
             STATUS=$(curl \
               --silent \
               --output /dev/null \

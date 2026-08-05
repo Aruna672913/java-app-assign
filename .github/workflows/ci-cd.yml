@@ -235,18 +235,22 @@ jobs:
 
           EOF
 
-      - name: Copy WAR To EC2
-        run: |
-          scp -i ~/.ssh/key.pem \
+            - name: Copy WAR To EC2
+          run: |
+          scp \
+            -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/key.pem" \
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}:/tmp/$APP_NAME.war"
-      
-               - name: Deploy WAR To Tomcat
-            run: |
-          ssh -o StrictHostKeyChecking=no \
+
+      - name: Deploy WAR To Tomcat
+        run: |
+          ssh \
+            -o StrictHostKeyChecking=no \
             -i "$HOME/.ssh/key.pem" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
             "sudo /opt/tomcat/bin/shutdown.sh || true; \
+             sleep 5; \
              sudo rm -rf /opt/tomcat/webapps/$APP_NAME; \
              sudo rm -f /opt/tomcat/webapps/$APP_NAME.war; \
              sudo cp /tmp/$APP_NAME.war /opt/tomcat/webapps/$APP_NAME.war; \
@@ -254,7 +258,8 @@ jobs:
 
       - name: Verify Tomcat Deployment
         run: |
-          ssh -o StrictHostKeyChecking=no \
+          ssh \
+            -o StrictHostKeyChecking=no \
             -i "$HOME/.ssh/key.pem" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
             "sudo test -f /opt/tomcat/webapps/$APP_NAME.war && \
@@ -262,8 +267,15 @@ jobs:
 
           echo "Tomcat deployment verified"
           echo "Public IP: ${{ steps.server.outputs.public_ip }}"
+          echo "Port: 8080"
           echo "Application path: /$APP_NAME/"
+
+          echo "## Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "Public IP: ${{ steps.server.outputs.public_ip }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Port: 8080" >> "$GITHUB_STEP_SUMMARY"
+          echo "Application path: /$APP_NAME/" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup
         if: always()
-        run: rm -f "$HOME/.ssh/key.pem"
+        run: |
+          rm -f "$HOME/.ssh/key.pem"

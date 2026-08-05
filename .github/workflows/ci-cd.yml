@@ -241,52 +241,68 @@ jobs:
             "$WAR_FILE" \
             "$EC2_USER@${{ steps.server.outputs.public_ip }}:/tmp/$APP_NAME.war"
 
-      - name: Deploy Application
+           - name: Deploy application
         run: |
-          ssh -i ~/.ssh/key.pem \
-            $EC2_USER@${{ steps.server.outputs.public_ip }} \
-            "sudo bash -s" <<EOF
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i key.pem \
+            "$EC2_USER@${{ steps.ec2.outputs.ip }}" \
+            "sudo bash -s -- '$APP_NAME'" <<'REMOTE'
 
-          set -euo pipefail
+          set -e
+
+          APP_NAME="$1"
+          TOMCAT_VERSION="9.0.120"
+
+          dnf install -y \
+            java-17-amazon-corretto-headless \
+            tar
+
+          if [ ! -x /opt/tomcat/bin/startup.sh ]; then
+            curl -fsSL \
+              "https://archive.apache.org/dist/tomcat/tomcat-9/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz" \
+              -o /tmp/tomcat.tar.gz
+
+            mkdir -p /opt/tomcat
+
+            tar -xzf /tmp/tomcat.tar.gz \
+              -C /opt/tomcat \
+              --strip-components=1
+
+            chmod +x /opt/tomcat/bin/*.sh
+          fi
 
           /opt/tomcat/bin/shutdown.sh || true
+          sleep 5
 
-          sleep 10
+          rm -rf "/opt/tomcat/webapps/$APP_NAME"
+          rm -f "/opt/tomcat/webapps/$APP_NAME.war"
 
-          rm -rf /opt/tomcat/webapps/${APP_NAME}
-          rm -f /opt/tomcat/webapps/${APP_NAME}.war
-
-          cp /tmp/${APP_NAME}.war \
-            /opt/tomcat/webapps/${APP_NAME}.war
-
-          chmod 644 /opt/tomcat/webapps/${APP_NAME}.war
+          cp "/tmp/$APP_NAME.war" \
+            "/opt/tomcat/webapps/$APP_NAME.war"
 
           /opt/tomcat/bin/startup.sh
 
-          EOF
+          echo "Tomcat started."
 
-            - name: Verify Application
-              run: |
-                URL="http://${{ steps.server.outputs.public_ip }}:8080/${APP_NAME}/"
+          REMOTE
 
-                        for i in {1..30}; do
-                      STATUS=$(curl \
-                                --silent \
-                                  --output /dev/null \
-                                  --write-out "%{http_code}" \
-                            "$URL" || true)
+      - name: Verify deployment
+        run: |
+          URL="http://${{ steps.ec2.outputs.ip }}:$TOMCAT_PORT/$APP_NAME/"
 
-                  echo "Attempt $i: HTTP $STATUS"
+          curl \
+            --fail \
+            --retry 15 \
+            --retry-delay 10 \
+            --retry-connrefused \
+            "$URL"
 
-                if [ "$STATUS" = "200" ]; then
-                        echo "Deployment successful"
-                exit 0
-                fi
+          echo "Application deployed successfully"
+          echo "Application URL: $URL"
+          echo "Application URL: [$URL]($URL)" >> "$GITHUB_STEP_SUMMARY"
 
-                sleep 10
-                done
-          exit 1
-      - name: Cleanup SSH Key
+      - name: Cleanup
         if: always()
         run: |
-          rm -f ~/.ssh/key.pem
+          rm -f key.pem

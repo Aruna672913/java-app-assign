@@ -207,36 +207,39 @@ jobs:
 
           exit 1
 
-      - name: Install Java And Tomcat
+            - name: Install Java And Tomcat
+              run: |
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/key.pem" \
+            "$EC2_USER@${{ steps.server.outputs.public_ip }}" "
+              set -e
+
+              sudo dnf install -y \
+                java-17-amazon-corretto-devel \
+                wget \
+                tar
+
+              if [ ! -f /opt/tomcat/bin/startup.sh ]; then
+                wget -q \
+                  -O /tmp/tomcat.tar.gz \
+                  https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
+
+                sudo rm -rf /opt/tomcat
+                sudo mkdir -p /opt/tomcat
+
+                sudo tar -xzf /tmp/tomcat.tar.gz \
+                  -C /opt/tomcat \
+                  --strip-components=1
+
+                sudo chmod +x /opt/tomcat/bin/*.sh
+              fi
+
+              echo 'Java and Tomcat installation completed'
+            "
+
+      - name: Copy WAR To EC2
         run: |
-          ssh -i ~/.ssh/key.pem \
-            $EC2_USER@${{ steps.server.outputs.public_ip }} \
-            "sudo bash -s" <<EOF
-
-          set -euo pipefail
-
-          dnf install -y java-17-amazon-corretto-devel wget tar
-
-          if [ ! -f /opt/tomcat/bin/startup.sh ]; then
-
-            wget -q \
-              -O /tmp/tomcat.tar.gz \
-              "https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz"
-
-            rm -rf /opt/tomcat
-            mkdir -p /opt/tomcat
-
-            tar -xzf /tmp/tomcat.tar.gz \
-              -C /opt/tomcat \
-              --strip-components=1
-
-            chmod +x /opt/tomcat/bin/*.sh
-          fi
-
-          EOF
-
-            - name: Copy WAR To EC2
-          run: |
           scp \
             -o StrictHostKeyChecking=no \
             -i "$HOME/.ssh/key.pem" \
@@ -248,31 +251,68 @@ jobs:
           ssh \
             -o StrictHostKeyChecking=no \
             -i "$HOME/.ssh/key.pem" \
-            "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
-            "sudo /opt/tomcat/bin/shutdown.sh || true; \
-             sleep 5; \
-             sudo rm -rf /opt/tomcat/webapps/$APP_NAME; \
-             sudo rm -f /opt/tomcat/webapps/$APP_NAME.war; \
-             sudo cp /tmp/$APP_NAME.war /opt/tomcat/webapps/$APP_NAME.war; \
-             sudo /opt/tomcat/bin/startup.sh"
+            "$EC2_USER@${{ steps.server.outputs.public_ip }}" "
+              set -e
+
+              echo 'Stopping Tomcat'
+              sudo /opt/tomcat/bin/shutdown.sh || true
+              sleep 5
+
+              echo 'Removing old application'
+              sudo rm -rf /opt/tomcat/webapps/$APP_NAME
+              sudo rm -f /opt/tomcat/webapps/$APP_NAME.war
+
+              echo 'Deploying latest WAR'
+              sudo cp /tmp/$APP_NAME.war \
+                /opt/tomcat/webapps/$APP_NAME.war
+
+              echo 'Starting Tomcat'
+              sudo /opt/tomcat/bin/startup.sh
+              sleep 10
+
+              echo 'Tomcat deployment completed'
+            "
 
       - name: Verify Tomcat Deployment
         run: |
           ssh \
             -o StrictHostKeyChecking=no \
             -i "$HOME/.ssh/key.pem" \
-            "$EC2_USER@${{ steps.server.outputs.public_ip }}" \
-            "sudo test -f /opt/tomcat/webapps/$APP_NAME.war && \
-             sudo pgrep -f org.apache.catalina.startup.Bootstrap"
+            "$EC2_USER@${{ steps.server.outputs.public_ip }}" "
+              set -e
+
+              echo 'Checking WAR file'
+              sudo test -f /opt/tomcat/webapps/$APP_NAME.war
+
+              echo 'Checking Tomcat process'
+              sudo pgrep -f org.apache.catalina.startup.Bootstrap \
+                > /dev/null
+
+              echo 'Checking application directory'
+
+              for attempt in {1..12}; do
+                if sudo test -d /opt/tomcat/webapps/$APP_NAME; then
+                  echo 'Application extracted successfully'
+                  exit 0
+                fi
+
+                echo \"Waiting for deployment: \$attempt/12\"
+                sleep 5
+              done
+
+              echo 'Application directory was not created'
+              sudo tail -n 100 /opt/tomcat/logs/catalina.out || true
+              exit 1
+            "
 
           echo "Tomcat deployment verified"
           echo "Public IP: ${{ steps.server.outputs.public_ip }}"
-          echo "Port: 8080"
+          echo "Port: $TOMCAT_PORT"
           echo "Application path: /$APP_NAME/"
 
           echo "## Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
           echo "Public IP: ${{ steps.server.outputs.public_ip }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Port: 8080" >> "$GITHUB_STEP_SUMMARY"
+          echo "Port: $TOMCAT_PORT" >> "$GITHUB_STEP_SUMMARY"
           echo "Application path: /$APP_NAME/" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup

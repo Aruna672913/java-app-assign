@@ -1,0 +1,261 @@
+env:
+  EC2_NAME: Webserver
+  EC2_USER: ec2-user
+  APP_NAME: devopsproject
+  WAR_FILE: target/devopsproject.war
+  SG_NAME: java-app-sg
+  TOMCAT_VERSION: 10.1.57
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Your checkout, Java setup, Maven build and Sonar steps come above
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify AWS Access
+        run: aws sts get-caller-identity
+
+      # 1. First check whether EC2 already exists
+      # 2. Create infrastructure only when EC2 is missing
+      - name: Check Or Create EC2
+        id: ec2
+        env:
+          AWS_KEY_NAME: ${{ secrets.AWS_KEY_NAME }}
+        run: |
+          set -e
+
+          echo "Checking whether EC2 exists..."
+
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=$EC2_NAME" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[].Instances[].InstanceId | [0]" \
+            --output text)
+
+          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+            echo "EC2 not found. Creating infrastructure..."
+
+            # Get default VPC
+            VPC_ID=$(aws ec2 describe-vpcs \
+              --filters "Name=is-default,Values=true" \
+              --query "Vpcs[0].VpcId" \
+              --output text)
+
+            if [ "$VPC_ID" = "None" ] || [ -z "$VPC_ID" ]; then
+              echo "Default VPC not found."
+              exit 1
+            fi
+
+            # Get one default subnet
+            SUBNET_ID=$(aws ec2 describe-subnets \
+              --filters \
+                "Name=vpc-id,Values=$VPC_ID" \
+                "Name=default-for-az,Values=true" \
+              --query "Subnets[0].SubnetId" \
+              --output text)
+
+            if [ "$SUBNET_ID" = "None" ] || [ -z "$SUBNET_ID" ]; then
+              echo "Default subnet not found."
+              exit 1
+            fi
+
+            # Check whether security group exists
+            SG_ID=$(aws ec2 describe-security-groups \
+              --filters \
+                "Name=group-name,Values=$SG_NAME" \
+                "Name=vpc-id,Values=$VPC_ID" \
+              --query "SecurityGroups[0].GroupId" \
+              --output text)
+
+            # Create security group when missing
+            if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
+              SG_ID=$(aws ec2 create-security-group \
+                --group-name "$SG_NAME" \
+                --description "Java Tomcat application security group" \
+                --vpc-id "$VPC_ID" \
+                --query "GroupId" \
+                --output text)
+
+              echo "Security group created: $SG_ID"
+            else
+              echo "Using existing security group: $SG_ID"
+            fi
+
+            # Allow SSH
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$SG_ID" \
+              --protocol tcp \
+              --port 22 \
+              --cidr 0.0.0.0/0 2>/dev/null || true
+
+            # Allow Tomcat
+            aws ec2 authorize-security-group-ingress \
+              --group-id "$SG_ID" \
+              --protocol tcp \
+              --port 8080 \
+              --cidr 0.0.0.0/0 2>/dev/null || true
+
+            # Get latest Amazon Linux 2023 AMI
+            AMI_ID=$(aws ec2 describe-images \
+              --owners amazon \
+              --filters \
+                "Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64" \
+                "Name=architecture,Values=x86_64" \
+                "Name=state,Values=available" \
+              --query "sort_by(Images,&CreationDate)[-1].ImageId" \
+              --output text)
+
+            if [ "$AMI_ID" = "None" ] || [ -z "$AMI_ID" ]; then
+              echo "Amazon Linux AMI not found."
+              exit 1
+            fi
+
+            # Create EC2
+            INSTANCE_ID=$(aws ec2 run-instances \
+              --image-id "$AMI_ID" \
+              --instance-type t3.micro \
+              --count 1 \
+              --key-name "$AWS_KEY_NAME" \
+              --subnet-id "$SUBNET_ID" \
+              --security-group-ids "$SG_ID" \
+              --associate-public-ip-address \
+              --tag-specifications \
+                "ResourceType=instance,Tags=[{Key=Name,Value=$EC2_NAME}]" \
+              --query "Instances[0].InstanceId" \
+              --output text)
+
+            echo "EC2 created: $INSTANCE_ID"
+          else
+            echo "Existing EC2 found: $INSTANCE_ID"
+          fi
+
+          # Get current instance state
+          STATE=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].State.Name" \
+            --output text)
+
+          echo "Current EC2 state: $STATE"
+
+          # Wait when instance is stopping
+          if [ "$STATE" = "stopping" ]; then
+            aws ec2 wait instance-stopped \
+              --instance-ids "$INSTANCE_ID"
+
+            STATE="stopped"
+          fi
+
+          # Start stopped EC2
+          if [ "$STATE" = "stopped" ]; then
+            echo "Starting EC2..."
+
+            aws ec2 start-instances \
+              --instance-ids "$INSTANCE_ID"
+          fi
+
+          # Wait until EC2 is ready
+          aws ec2 wait instance-running \
+            --instance-ids "$INSTANCE_ID"
+
+          aws ec2 wait instance-status-ok \
+            --instance-ids "$INSTANCE_ID"
+
+          # Get public IP
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text)
+
+          if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
+            echo "EC2 does not have a public IP."
+            exit 1
+          fi
+
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+
+          echo "Instance ID: $INSTANCE_ID"
+          echo "Public IP: $PUBLIC_IP"
+
+      - name: Prepare SSH Key
+        env:
+          EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$EC2_PRIVATE_KEY" > ~/.ssh/key.pem
+          chmod 600 ~/.ssh/key.pem
+
+      - name: Wait For SSH
+        run: |
+          for i in {1..30}; do
+            if ssh \
+              -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              -i ~/.ssh/key.pem \
+              "$EC2_USER@${{ steps.ec2.outputs.public_ip }}" \
+              "echo SSH is ready"; then
+              exit 0
+            fi
+
+            echo "Waiting for SSH..."
+            sleep 20
+          done
+
+          echo "SSH connection failed."
+          exit 1
+
+      - name: Install Java And Tomcat
+        run: |
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i ~/.ssh/key.pem \
+            "$EC2_USER@${{ steps.ec2.outputs.public_ip }}" "
+              set -e
+
+              sudo dnf install -y \
+                java-17-amazon-corretto-devel \
+                wget \
+                tar
+
+              if [ ! -f /opt/tomcat/bin/startup.sh ]; then
+                echo 'Installing Tomcat...'
+
+                sudo rm -rf /opt/tomcat
+                sudo mkdir -p /opt/tomcat
+
+                sudo wget -q \
+                  -O /tmp/tomcat.tar.gz \
+                  https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
+
+                sudo tar -xzf /tmp/tomcat.tar.gz \
+                  -C /opt/tomcat \
+                  --strip-components=1
+
+                sudo chmod +x /opt/tomcat/bin/*.sh
+                sudo rm -f /tmp/tomcat.tar.gz
+
+                echo 'Tomcat installed successfully.'
+              else
+                echo 'Tomcat is already installed.'
+              fi
+
+              java -version
+              sudo /opt/tomcat/bin/version.sh
+            "
+
+      - name: Copy WAR To EC2
+        run: |
+          scp \
+            -o StrictHostKeyChecking=no \
+            -i ~/.ssh/key.pem \
+            "$WAR_FILE" \
+            "$EC2_USER@${{ steps.ec2.outputs.public_ip }}:/tmp/$APP_NAME.war"

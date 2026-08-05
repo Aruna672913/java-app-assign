@@ -265,31 +265,27 @@ jobs:
 
           EOF
 
-      - name: Verify Application
-        run: |
-          URL="http://${{ steps.server.outputs.public_ip }}:8080/${APP_NAME}/"
+            - name: Verify Application
+              run: |
+                URL="https://your-domain.com/${APP_NAME}/"
 
-          for i in {1..30}; do
-            STATUS=$(curl \
-              --silent \
-              --output /dev/null \
-              --write-out "%{http_code}" \
-              "$URL" || true)
+                        for i in {1..30}; do
+                      STATUS=$(curl \
+                                --silent \
+                                  --output /dev/null \
+                                  --write-out "%{http_code}" \
+                            "$URL" || true)
 
-            echo "Attempt $i: HTTP $STATUS"
+                  echo "Attempt $i: HTTP $STATUS"
 
-            if [ "$STATUS" = "200" ]; then
-              echo "Deployment successful"
-              echo "$URL"
-              exit 0
-            fi
+                if [ "$STATUS" = "200" ]; then
+                        echo "Deployment successful"
+                exit 0
+                fi
 
-            sleep 10
-          done
-
-          echo "Application failed health check"
+                sleep 10
+                done
           exit 1
-
       - name: Cleanup SSH Key
         if: always()
         run: |

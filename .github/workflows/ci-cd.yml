@@ -276,4 +276,26 @@ jobs:
 
           REMOTE
 
-     
+      - name: Verify Tomcat Deployment
+        run: |
+          URL="http://${{ steps.server.outputs.public_ip }}:$TOMCAT_PORT/$APP_NAME/"
+
+          echo "Checking application: $URL"
+
+          curl \
+            --fail \
+            --retry 18 \
+            --retry-delay 10 \
+            --retry-connrefused \
+            "$URL"
+
+          echo "Application deployed successfully"
+          echo "Application URL: $URL"
+
+          echo "## Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "Application URL: [$URL]($URL)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f ~/.ssh/key.pem  

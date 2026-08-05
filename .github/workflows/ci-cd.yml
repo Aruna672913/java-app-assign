@@ -278,24 +278,50 @@ jobs:
 
       - name: Verify Tomcat Deployment
         run: |
-          URL="http://${{ steps.server.outputs.public_ip }}:$TOMCAT_PORT/$APP_NAME/"
+          IP="${{ steps.server.outputs.public_ip }}"
+          URL="http://${IP}:${TOMCAT_PORT}/${APP_NAME}/"
 
-          echo "Checking application: $URL"
+          echo "Checking public URL: $URL"
 
-          curl \
-            --fail \
-            --retry 18 \
-            --retry-delay 10 \
-            --retry-connrefused \
-            "$URL"
+          for attempt in {1..18}; do
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              --connect-timeout 10 \
+              "$URL" >/dev/null; then
 
-          echo "Application deployed successfully"
-          echo "Application URL: $URL"
+              echo "Application deployed successfully"
+              echo "Application URL: $URL"
 
-          echo "## Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
-          echo "Application URL: [$URL]($URL)" >> "$GITHUB_STEP_SUMMARY"
+              echo "## Deployment Successful" \
+                >> "$GITHUB_STEP_SUMMARY"
+
+              echo "Application URL: [$URL]($URL)" \
+                >> "$GITHUB_STEP_SUMMARY"
+
+              exit 0
+            fi
+
+            echo "Waiting for public application: $attempt/18"
+            sleep 10
+          done
+
+          echo "Public URL verification failed"
+
+          echo "Checking application inside EC2"
+
+          ssh \
+            -o StrictHostKeyChecking=no \
+            -i "$HOME/.ssh/key.pem" \
+            "$EC2_USER@$IP" \
+            "sudo ss -ltnp | grep ':${TOMCAT_PORT}' || true;
+             sudo curl -I http://127.0.0.1:${TOMCAT_PORT}/${APP_NAME}/ || true;
+             sudo tail -n 100 /opt/tomcat/logs/catalina.out || true"
+
+          exit 1
 
       - name: Cleanup
         if: always()
         run: |
-          rm -f ~/.ssh/key.pem  
+          rm -f "$HOME/.ssh/key.pem"

@@ -450,7 +450,8 @@ jobs:
           echo "Deployment completed successfully"
           echo "Application URL:"
           echo "http://$PUBLIC_IP:8080/$APP_NAME/"
-       - name: Cleanup
+    
+      - name: Cleanup
         if: always()
         run: |
           rm -f "$HOME/.ssh/key.pem"

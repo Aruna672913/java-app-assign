@@ -5,10 +5,7 @@ on:
     branches:
       - main
   workflow_dispatch:
-
-permissions:
-  contents: read
-
+  
 env:
   EC2_NAME: Webserver
   EC2_USER: ec2-user
@@ -465,8 +462,7 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Instance ID: ${{ needs.infra.outputs.instance_id }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Public IP: $PUBLIC_IP" >> "$GITHUB_STEP_SUMMARY"
-          echo "Application URL: http://$PUBLIC_IP:$TOMCAT_PORT/$APP_NAME/" >> "$GITHUB_STEP_SUMMARY"
-
+          
       - name: Cleanup SSH Key
         if: always()
         run: rm -f "$HOME/.ssh/key.pem"

@@ -456,12 +456,16 @@ jobs:
       - name: Deployment Summary
         run: |
           echo "Tomcat deployment verified"
-          echo "Application URL: http://$PUBLIC_IP:$TOMCAT_PORT/$APP_NAME/"
+          echo "Public IP: $PUBLIC_IP"
+          echo "Port: $TOMCAT_PORT"
+          echo "Application path: /$APP_NAME/"
 
           echo "## Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Instance ID: ${{ needs.infra.outputs.instance_id }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Public IP: $PUBLIC_IP" >> "$GITHUB_STEP_SUMMARY"
+          echo "Port: $TOMCAT_PORT" >> "$GITHUB_STEP_SUMMARY"
+          echo "Application path: /$APP_NAME/" >> "$GITHUB_STEP_SUMMARY"
           
       - name: Cleanup SSH Key
         if: always()

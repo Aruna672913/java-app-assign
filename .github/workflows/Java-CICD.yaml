@@ -5,7 +5,10 @@ on:
     branches:
       - main
   workflow_dispatch:
-  
+
+permissions:
+  contents: read
+
 env:
   EC2_NAME: Webserver
   EC2_USER: ec2-user
@@ -340,8 +343,11 @@ jobs:
             exit 1
           fi
 
-          if [ ! -f /opt/tomcat/bin/startup.sh ]; then
-            echo "Installing Tomcat ${TOMCAT_VERSION}"
+          if [ ! -f /opt/tomcat/bin/catalina.sh ] || \
+             [ ! -f /opt/tomcat/bin/startup.sh ] || \
+             [ ! -f /opt/tomcat/bin/shutdown.sh ] || \
+             [ ! -f /opt/tomcat/bin/version.sh ]; then
+            echo "Installing or repairing Tomcat ${TOMCAT_VERSION}"
 
             sudo rm -rf /opt/tomcat
             sudo rm -f /tmp/tomcat.tar.gz
@@ -427,7 +433,7 @@ jobs:
             -o StrictHostKeyChecking=no \
             -i "$HOME/.ssh/key.pem" \
             "$EC2_USER@$PUBLIC_IP" \
-            "APP_NAME='$APP_NAME' bash -s" <<'REMOTE_SCRIPT'
+            "APP_NAME='$APP_NAME' TOMCAT_PORT='$TOMCAT_PORT' bash -s" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           sudo test -f "/opt/tomcat/webapps/${APP_NAME}.war"
@@ -438,17 +444,26 @@ jobs:
             exit 1
           fi
 
+          PROTOCOL="http"
+          LOCAL_URL="${PROTOCOL}://127.0.0.1:${TOMCAT_PORT}/${APP_NAME}/"
+
           for attempt in {1..12}; do
             if sudo test -d "/opt/tomcat/webapps/${APP_NAME}"; then
-              echo "Application extracted successfully"
-              exit 0
+              HTTP_CODE=$(curl --silent --output /dev/null \
+                --write-out "%{http_code}" "$LOCAL_URL" || true)
+
+              if [ "$HTTP_CODE" -ge 200 ] 2>/dev/null && \
+                 [ "$HTTP_CODE" -lt 400 ] 2>/dev/null; then
+                echo "Application deployment verified with HTTP status: $HTTP_CODE"
+                exit 0
+              fi
             fi
 
-            echo "Waiting for deployment: ${attempt}/12"
+            echo "Waiting for application response: ${attempt}/12"
             sleep 5
           done
 
-          echo "Application directory was not created"
+          echo "Application did not become ready"
           sudo tail -n 100 /opt/tomcat/logs/catalina.out || true
           exit 1
           REMOTE_SCRIPT
@@ -466,7 +481,7 @@ jobs:
           echo "Public IP: $PUBLIC_IP" >> "$GITHUB_STEP_SUMMARY"
           echo "Port: $TOMCAT_PORT" >> "$GITHUB_STEP_SUMMARY"
           echo "Application path: /$APP_NAME/" >> "$GITHUB_STEP_SUMMARY"
-          
+
       - name: Cleanup SSH Key
         if: always()
         run: rm -f "$HOME/.ssh/key.pem"

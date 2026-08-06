@@ -6,9 +6,6 @@ on:
       - main
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 env:
   EC2_NAME: Webserver
   EC2_USER: ec2-user

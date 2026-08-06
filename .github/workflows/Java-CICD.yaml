@@ -6,6 +6,9 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   EC2_NAME: Webserver
   EC2_USER: ec2-user
@@ -16,10 +19,10 @@ env:
 
 jobs:
   # =========================================================
-  # JOB 1: BUILD, TEST, SONARCLOUD SCAN AND UPLOAD WAR
+  # JOB 1: BUILD, TEST, SONARCLOUD AND UPLOAD WAR
   # =========================================================
   build:
-    name: Build and SonarCloud Scan
+    name: Build Application
     runs-on: ubuntu-latest
 
     steps:
@@ -36,7 +39,7 @@ jobs:
           cache: maven
 
       - name: Build WAR
-        run: mvn clean package
+        run: mvn -B clean package
 
       - name: Verify WAR
         run: |
@@ -47,13 +50,13 @@ jobs:
             exit 1
           fi
 
-          echo "WAR file created successfully"
+          echo "WAR file created successfully: $WAR_FILE"
 
       - name: SonarCloud Scan
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          mvn org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+          mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
             -Dsonar.token="$SONAR_TOKEN" \
             -Dsonar.organization=aruna672913 \
             -Dsonar.projectKey=Aruna672913_java-app-assign \
@@ -62,17 +65,16 @@ jobs:
       - name: Upload WAR Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: devopsproject-war
+          name: application-war
           path: ${{ env.WAR_FILE }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 5
 
   # =========================================================
   # JOB 2: CHECK OR CREATE EC2 INFRASTRUCTURE
-  # Runs only after the build job succeeds
   # =========================================================
   infra:
-    name: Provision AWS EC2 Infrastructure
+    name: Provision EC2 Infrastructure
     runs-on: ubuntu-latest
     needs: build
 
@@ -96,8 +98,8 @@ jobs:
         run: |
           INSTANCE_ID=$(aws ec2 describe-instances \
             --filters \
-            "Name=tag:Name,Values=$EC2_NAME" \
-            "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              "Name=tag:Name,Values=$EC2_NAME" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
             --query "Reservations[].Instances[].InstanceId | [0]" \
             --output text)
 
@@ -105,7 +107,7 @@ jobs:
             echo "EC2 instance does not exist"
             echo "exists=false" >> "$GITHUB_OUTPUT"
           else
-            echo "EC2 instance already exists: $INSTANCE_ID"
+            echo "Existing EC2 instance found: $INSTANCE_ID"
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
           fi
@@ -116,6 +118,8 @@ jobs:
         env:
           AWS_KEY_NAME: ${{ secrets.AWS_KEY_NAME }}
         run: |
+          set -e
+
           VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=is-default,Values=true" \
             --query "Vpcs[0].VpcId" \
@@ -128,8 +132,8 @@ jobs:
 
           SUBNET_ID=$(aws ec2 describe-subnets \
             --filters \
-            "Name=vpc-id,Values=$VPC_ID" \
-            "Name=default-for-az,Values=true" \
+              "Name=vpc-id,Values=$VPC_ID" \
+              "Name=default-for-az,Values=true" \
             --query "Subnets[0].SubnetId" \
             --output text)
 
@@ -140,8 +144,8 @@ jobs:
 
           SG_ID=$(aws ec2 describe-security-groups \
             --filters \
-            "Name=group-name,Values=java-app-sg" \
-            "Name=vpc-id,Values=$VPC_ID" \
+              "Name=group-name,Values=java-app-sg" \
+              "Name=vpc-id,Values=$VPC_ID" \
             --query "SecurityGroups[0].GroupId" \
             --output text)
 
@@ -162,20 +166,20 @@ jobs:
             --group-id "$SG_ID" \
             --protocol tcp \
             --port 22 \
-            --cidr 0.0.0.0/0 || true
+            --cidr 0.0.0.0/0 2>/dev/null || true
 
           aws ec2 authorize-security-group-ingress \
             --group-id "$SG_ID" \
             --protocol tcp \
             --port "$TOMCAT_PORT" \
-            --cidr 0.0.0.0/0 || true
+            --cidr 0.0.0.0/0 2>/dev/null || true
 
           AMI_ID=$(aws ec2 describe-images \
             --owners amazon \
             --filters \
-            "Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64" \
-            "Name=architecture,Values=x86_64" \
-            "Name=state,Values=available" \
+              "Name=name,Values=al2023-ami-2023.*-kernel-6.1-x86_64" \
+              "Name=architecture,Values=x86_64" \
+              "Name=state,Values=available" \
             --query "sort_by(Images,&CreationDate)[-1].ImageId" \
             --output text)
 
@@ -191,9 +195,15 @@ jobs:
             --security-group-ids "$SG_ID" \
             --subnet-id "$SUBNET_ID" \
             --associate-public-ip-address \
-            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$EC2_NAME}]" \
+            --tag-specifications \
+              "ResourceType=instance,Tags=[{Key=Name,Value=$EC2_NAME}]" \
             --query "Instances[0].InstanceId" \
             --output text)
+
+          if [ "$INSTANCE_ID" = "None" ] || [ -z "$INSTANCE_ID" ]; then
+            echo "EC2 instance creation failed"
+            exit 1
+          fi
 
           echo "Created EC2 instance: $INSTANCE_ID"
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
@@ -204,6 +214,8 @@ jobs:
       - name: Get EC2 Details
         id: server
         run: |
+          set -e
+
           if [ "${{ steps.check_ec2.outputs.exists }}" = "true" ]; then
             INSTANCE_ID="${{ steps.check_ec2.outputs.instance_id }}"
           else
@@ -211,7 +223,7 @@ jobs:
           fi
 
           if [ -z "$INSTANCE_ID" ]; then
-            echo "EC2 instance ID is empty"
+            echo "Instance ID is empty"
             exit 1
           fi
 
@@ -220,19 +232,21 @@ jobs:
             --query "Reservations[0].Instances[0].State.Name" \
             --output text)
 
+          echo "Current EC2 state: $STATE"
+
           if [ "$STATE" = "stopping" ]; then
-            echo "Waiting for EC2 instance to stop"
             aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
             STATE="stopped"
           fi
 
           if [ "$STATE" = "stopped" ]; then
-            echo "Starting stopped EC2 instance"
             aws ec2 start-instances --instance-ids "$INSTANCE_ID"
             aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
           elif [ "$STATE" = "pending" ]; then
-            echo "Waiting for pending EC2 instance"
             aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          elif [ "$STATE" != "running" ]; then
+            echo "Unsupported EC2 state: $STATE"
+            exit 1
           fi
 
           aws ec2 wait instance-status-ok --instance-ids "$INSTANCE_ID"
@@ -243,22 +257,21 @@ jobs:
             --output text)
 
           if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
-            echo "EC2 public IP was not found"
+            echo "Public IP was not found"
             exit 1
           fi
-
-          echo "EC2 Instance ID: $INSTANCE_ID"
-          echo "EC2 Public IP: $PUBLIC_IP"
 
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
           echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
 
+          echo "EC2 instance ID: $INSTANCE_ID"
+          echo "EC2 public IP: $PUBLIC_IP"
+
   # =========================================================
   # JOB 3: DOWNLOAD WAR AND DEPLOY TO TOMCAT
-  # Runs only after both build and infra jobs succeed
   # =========================================================
   deploy:
-    name: Deploy WAR to Tomcat
+    name: Deploy Application
     runs-on: ubuntu-latest
     needs:
       - build
@@ -271,7 +284,7 @@ jobs:
       - name: Download WAR Artifact
         uses: actions/download-artifact@v4
         with:
-          name: devopsproject-war
+          name: application-war
           path: target
 
       - name: Verify Downloaded WAR
@@ -279,16 +292,9 @@ jobs:
           ls -la target
 
           if [ ! -f "$WAR_FILE" ]; then
-            echo "Downloaded WAR file not found: $WAR_FILE"
+            echo "Downloaded WAR file was not found: $WAR_FILE"
             exit 1
           fi
-
-          if [ -z "$PUBLIC_IP" ]; then
-            echo "EC2 public IP is empty"
-            exit 1
-          fi
-
-          echo "WAR file and EC2 public IP are available"
 
       - name: Prepare SSH Key
         env:
@@ -300,13 +306,12 @@ jobs:
 
       - name: Wait For SSH
         run: |
-          for i in {1..30}; do
-            echo "Checking SSH connection: $i/30"
+          for attempt in {1..30}; do
+            echo "Checking SSH connection: $attempt/30"
 
             if ssh \
-              -o ConnectTimeout=10 \
               -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 \
               -i "$HOME/.ssh/key.pem" \
               "$EC2_USER@$PUBLIC_IP" \
               "echo SSH Ready"; then
@@ -323,49 +328,70 @@ jobs:
         run: |
           ssh \
             -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
             -i "$HOME/.ssh/key.pem" \
-            "$EC2_USER@$PUBLIC_IP" "
-              set -e
+            "$EC2_USER@$PUBLIC_IP" \
+            "TOMCAT_VERSION='$TOMCAT_VERSION' bash -s" <<'REMOTE_SCRIPT'
+          set -euo pipefail
 
-              sudo dnf install -y \
-                java-17-amazon-corretto-devel \
-                wget \
-                tar
+          sudo dnf install -y \
+            java-17-amazon-corretto-devel \
+            tar \
+            gzip
 
-              if [ ! -f /opt/tomcat/bin/startup.sh ]; then
-                echo 'Installing Tomcat'
+          if ! command -v curl >/dev/null 2>&1; then
+            echo "The curl command is not available"
+            exit 1
+          fi
 
-                sudo rm -f /tmp/tomcat.tar.gz
-                sudo rm -rf /opt/tomcat
-                sudo mkdir -p /opt/tomcat
+          if [ ! -f /opt/tomcat/bin/startup.sh ]; then
+            echo "Installing Tomcat ${TOMCAT_VERSION}"
 
-                sudo wget -q \
-                  -O /tmp/tomcat.tar.gz \
-                  https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
+            sudo rm -rf /opt/tomcat
+            sudo rm -f /tmp/tomcat.tar.gz
+            sudo mkdir -p /opt/tomcat
 
-                sudo tar -xzf /tmp/tomcat.tar.gz \
-                  -C /opt/tomcat \
-                  --strip-components=1
+            sudo curl \
+              --fail \
+              --location \
+              --retry 3 \
+              --retry-delay 5 \
+              --output /tmp/tomcat.tar.gz \
+              "https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz"
 
-                sudo test -f /opt/tomcat/bin/startup.sh
-                sudo test -f /opt/tomcat/bin/shutdown.sh
-                sudo chmod +x /opt/tomcat/bin/*.sh
-                sudo rm -f /tmp/tomcat.tar.gz
+            echo "Validating Tomcat archive"
+            sudo tar -tzf /tmp/tomcat.tar.gz >/dev/null
 
-                echo 'Tomcat installed successfully'
-              else
-                echo 'Tomcat is already installed'
-              fi
+            echo "Extracting Tomcat"
+            sudo tar -xzf /tmp/tomcat.tar.gz \
+              -C /opt/tomcat \
+              --strip-components=1
 
-              sudo /opt/tomcat/bin/version.sh
-            "
+            echo "Validating Tomcat files"
+            sudo test -f /opt/tomcat/bin/catalina.sh
+            sudo test -f /opt/tomcat/bin/startup.sh
+            sudo test -f /opt/tomcat/bin/shutdown.sh
+            sudo test -f /opt/tomcat/bin/version.sh
+
+            sudo chmod 755 \
+              /opt/tomcat/bin/catalina.sh \
+              /opt/tomcat/bin/startup.sh \
+              /opt/tomcat/bin/shutdown.sh \
+              /opt/tomcat/bin/version.sh
+
+            sudo rm -f /tmp/tomcat.tar.gz
+
+            echo "Tomcat installed successfully"
+          else
+            echo "Tomcat is already installed"
+          fi
+
+          sudo /opt/tomcat/bin/version.sh
+          REMOTE_SCRIPT
 
       - name: Copy WAR To EC2
         run: |
           scp \
             -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
             -i "$HOME/.ssh/key.pem" \
             "$WAR_FILE" \
             "$EC2_USER@$PUBLIC_IP:/tmp/$APP_NAME.war"
@@ -374,64 +400,69 @@ jobs:
         run: |
           ssh \
             -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
             -i "$HOME/.ssh/key.pem" \
-            "$EC2_USER@$PUBLIC_IP" "
-              set -e
+            "$EC2_USER@$PUBLIC_IP" \
+            "APP_NAME='$APP_NAME' bash -s" <<'REMOTE_SCRIPT'
+          set -euo pipefail
 
-              echo 'Stopping Tomcat'
-              sudo /opt/tomcat/bin/shutdown.sh || true
-              sleep 5
+          echo "Stopping Tomcat"
+          sudo /opt/tomcat/bin/shutdown.sh || true
+          sleep 5
 
-              echo 'Removing old application'
-              sudo rm -rf /opt/tomcat/webapps/$APP_NAME
-              sudo rm -f /opt/tomcat/webapps/$APP_NAME.war
+          echo "Removing old application"
+          sudo rm -rf "/opt/tomcat/webapps/${APP_NAME}"
+          sudo rm -f "/opt/tomcat/webapps/${APP_NAME}.war"
 
-              echo 'Deploying latest WAR'
-              sudo cp /tmp/$APP_NAME.war \
-                /opt/tomcat/webapps/$APP_NAME.war
+          echo "Deploying latest WAR"
+          sudo cp "/tmp/${APP_NAME}.war" \
+            "/opt/tomcat/webapps/${APP_NAME}.war"
 
-              echo 'Starting Tomcat'
-              sudo /opt/tomcat/bin/startup.sh
-              sleep 10
+          echo "Starting Tomcat"
+          sudo /opt/tomcat/bin/startup.sh
+          sleep 10
 
-              echo 'Tomcat deployment completed'
-            "
+          echo "Tomcat deployment completed"
+          REMOTE_SCRIPT
 
       - name: Verify Tomcat Deployment
         run: |
           ssh \
             -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
             -i "$HOME/.ssh/key.pem" \
-            "$EC2_USER@$PUBLIC_IP" "
-              set -e
+            "$EC2_USER@$PUBLIC_IP" \
+            "APP_NAME='$APP_NAME' bash -s" <<'REMOTE_SCRIPT'
+          set -euo pipefail
 
-              echo 'Checking WAR file'
-              sudo test -f /opt/tomcat/webapps/$APP_NAME.war
+          sudo test -f "/opt/tomcat/webapps/${APP_NAME}.war"
 
-              echo 'Checking Tomcat process'
-              sudo pgrep -f org.apache.catalina.startup.Bootstrap > /dev/null
+          if ! sudo pgrep -f org.apache.catalina.startup.Bootstrap >/dev/null; then
+            echo "Tomcat process is not running"
+            sudo tail -n 100 /opt/tomcat/logs/catalina.out || true
+            exit 1
+          fi
 
-              for attempt in {1..12}; do
-                if sudo test -d /opt/tomcat/webapps/$APP_NAME; then
-                  echo 'Application extracted successfully'
-                  exit 0
-                fi
+          for attempt in {1..12}; do
+            if sudo test -d "/opt/tomcat/webapps/${APP_NAME}"; then
+              echo "Application extracted successfully"
+              exit 0
+            fi
 
-                echo \"Waiting for deployment: \$attempt/12\"
-                sleep 5
-              done
+            echo "Waiting for deployment: ${attempt}/12"
+            sleep 5
+          done
 
-              echo 'Application directory was not created'
-              sudo tail -n 100 /opt/tomcat/logs/catalina.out || true
-              exit 1
-            "
+          echo "Application directory was not created"
+          sudo tail -n 100 /opt/tomcat/logs/catalina.out || true
+          exit 1
+          REMOTE_SCRIPT
 
+      - name: Deployment Summary
+        run: |
           echo "Tomcat deployment verified"
           echo "Application URL: http://$PUBLIC_IP:$TOMCAT_PORT/$APP_NAME/"
 
           echo "## Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Instance ID: ${{ needs.infra.outputs.instance_id }}" >> "$GITHUB_STEP_SUMMARY"
           echo "Public IP: $PUBLIC_IP" >> "$GITHUB_STEP_SUMMARY"
           echo "Application URL: http://$PUBLIC_IP:$TOMCAT_PORT/$APP_NAME/" >> "$GITHUB_STEP_SUMMARY"

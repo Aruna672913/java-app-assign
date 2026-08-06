@@ -323,53 +323,41 @@ jobs:
         run: |
           ssh \
             -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
             -i "$HOME/.ssh/key.pem" \
-            "$EC2_USER@${{ needs.infra.outputs.public_ip }}" "
+            "$EC2_USER@$PUBLIC_IP" "
               set -e
 
               sudo dnf install -y \
                 java-17-amazon-corretto-devel \
-                curl \
-                tar \
-                gzip
+                wget \
+                tar
 
-              echo 'Removing incomplete Tomcat installation'
-              sudo rm -rf /opt/tomcat
-              sudo rm -f /tmp/tomcat.tar.gz
-              sudo mkdir -p /opt/tomcat
+              if [ ! -f /opt/tomcat/bin/startup.sh ]; then
+                echo 'Installing Tomcat'
 
-              echo 'Downloading Tomcat ${TOMCAT_VERSION}'
-              sudo curl \
-                --fail \
-                --location \
-                --retry 3 \
-                --retry-delay 5 \
-                --output /tmp/tomcat.tar.gz \
-                https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
+                sudo rm -f /tmp/tomcat.tar.gz
+                sudo rm -rf /opt/tomcat
+                sudo mkdir -p /opt/tomcat
 
-              echo 'Validating Tomcat archive'
-              sudo tar -tzf /tmp/tomcat.tar.gz > /dev/null
+                sudo wget -q \
+                  -O /tmp/tomcat.tar.gz \
+                  https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz
 
-              echo 'Extracting Tomcat'
-              sudo tar -xzf /tmp/tomcat.tar.gz \
-                -C /opt/tomcat \
-                --strip-components=1
+                sudo tar -xzf /tmp/tomcat.tar.gz \
+                  -C /opt/tomcat \
+                  --strip-components=1
 
-              echo 'Checking Tomcat files'
-              sudo test -f /opt/tomcat/bin/catalina.sh
-              sudo test -f /opt/tomcat/bin/startup.sh
-              sudo test -f /opt/tomcat/bin/shutdown.sh
-              sudo test -f /opt/tomcat/bin/version.sh
+                sudo test -f /opt/tomcat/bin/startup.sh
+                sudo test -f /opt/tomcat/bin/shutdown.sh
+                sudo chmod +x /opt/tomcat/bin/*.sh
+                sudo rm -f /tmp/tomcat.tar.gz
 
-              sudo chmod +x \
-                /opt/tomcat/bin/catalina.sh \
-                /opt/tomcat/bin/startup.sh \
-                /opt/tomcat/bin/shutdown.sh \
-                /opt/tomcat/bin/version.sh
+                echo 'Tomcat installed successfully'
+              else
+                echo 'Tomcat is already installed'
+              fi
 
-              sudo rm -f /tmp/tomcat.tar.gz
-
-              echo 'Tomcat installed successfully'
               sudo /opt/tomcat/bin/version.sh
             "
 
